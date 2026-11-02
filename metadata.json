@@ -1,0 +1,8 @@
+{
+  "name": "wscan+",
+  "description": "Wireless threat intelligence and intrusion detection platform with native Pixel AVF terminal integration, Shizuku/Root bridges, modular red/blue toolchain, hardware GPS/SDR forward-reverse telemetry, and .nyx AI sentinel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

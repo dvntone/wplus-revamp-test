@@ -1,0 +1,752 @@
+name: Android Release & Deploy
+
+# ── Channel → tag-suffix convention ──────────────────────────────────────────
+#
+#   Stable    v1.2.3
+#   RC        v1.2.3-rc.1   (or v1.2.3-rc1)
+#   Beta      v1.2.3-beta.1 (or v1.2.3-beta1)
+#   Alpha     v1.2.3-alpha.1 (or v1.2.3-alpha1)
+#   Dev       v1.2.3-dev.1
+#   Bleeding  v1.2.3-bleeding.1
+#
+# ── Auto-bump (workflow_dispatch only) ───────────────────────────────────────
+#
+#   When version_name = "auto" the workflow:
+#     1. Fetches the latest GitHub release (including pre-releases).
+#     2. Parses its channel and pre-release counter.
+#     3. Applies bump_type:
+#          auto/increment  → same channel, counter +1
+#                            (if last was stable, does patch +1 → alpha.1)
+#          promote         → advance one step in the channel progression
+#                            bleeding→dev→alpha→beta→rc→release
+#          patch           → base patch+1, restart at <target_channel>.1
+#          minor           → base minor+1, patch=0, restart at <target_channel>.1
+#          major           → base major+1, minor=0, patch=0, restart at <target_channel>.1
+#     4. Optionally overrides the resolved channel with build_channel.
+#
+# ── versionCode formula ───────────────────────────────────────────────────────
+#   MAJOR×10 000 000 + MINOR×100 000 + PATCH×1 000 + CHANNEL_OFFSET + pre_num
+#   Offsets:  bleeding=0  dev=100  alpha=200  beta=400  rc=600  release=900
+#   pre_num capped at 99 so a single version slot fits comfortably.
+#   Guarantees:  bleeding < dev < alpha < beta < rc < stable; later builds > earlier.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-beta[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-beta.[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-alpha[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-dev[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-dev.[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-bleeding[0-9]*"
+      - "v[0-9]+.[0-9]+.[0-9]+-bleeding.[0-9]*"
+
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: >
+          Version string (e.g. 1.2.3-alpha.2).
+          Leave as "auto" to have the workflow determine it from the last release.
+        required: false
+        default: "auto"
+      bump_type:
+        description: >
+          How to advance from the previous release (only used when version_name="auto").
+          auto/increment = stay in same channel, bump counter.
+          promote = advance one channel step (alpha→beta→rc→release).
+          patch/minor/major = reset to that bump level, restart at target channel.
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - increment
+          - promote
+          - patch
+          - minor
+          - major
+      build_channel:
+        description: >
+          Override the channel (e.g. force "beta" even if version string says alpha).
+          "auto" = derive from the version string / bump logic.
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - release
+          - rc
+          - beta
+          - alpha
+          - dev
+          - bleeding
+      create_release:
+        description: "Create a GitHub Release draft"
+        required: false
+        default: "false"
+        type: boolean
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════════════
+  # 0. RESOLVE  — single source of truth for every downstream job
+  # ══════════════════════════════════════════════════════════════════════════
+  resolve:
+    name: "Resolve: version, channel & auto-bump"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # read releases list
+
+    outputs:
+      version_name:      ${{ steps.calc.outputs.version_name }}
+      version_code:      ${{ steps.calc.outputs.version_code }}
+      channel:           ${{ steps.calc.outputs.channel }}
+      is_prerelease:     ${{ steps.calc.outputs.is_prerelease }}
+      build_aab:         ${{ steps.calc.outputs.build_aab }}
+      retention_days:    ${{ steps.calc.outputs.retention_days }}
+      channel_label:     ${{ steps.calc.outputs.channel_label }}
+      channel_emoji:     ${{ steps.calc.outputs.channel_emoji }}
+      prev_version:      ${{ steps.calc.outputs.prev_version }}
+      prev_channel:      ${{ steps.calc.outputs.prev_channel }}
+      bump_description:  ${{ steps.calc.outputs.bump_description }}
+
+    steps:
+      # ── Step A: fetch previous release from GitHub ──────────────────────
+      - name: Fetch previous release (for auto-bump)
+        id: prev
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // We need the most recent release AND the most recent pre-release
+            // so that promoting from alpha.2 correctly finds alpha.2 (not some
+            // older stable release that was published later in the UI).
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              per_page: 20,
+            });
+
+            // Sort by published_at descending (newest first).
+            const sorted = releases.sort(
+              (a, b) => new Date(b.published_at || b.created_at) -
+                        new Date(a.published_at || a.created_at)
+            );
+
+            const latest = sorted[0];
+            if (latest) {
+              core.setOutput('tag',        latest.tag_name);
+              core.setOutput('prerelease', String(latest.prerelease));
+              core.info(`Previous release: ${latest.tag_name} (prerelease=${latest.prerelease})`);
+            } else {
+              core.setOutput('tag',        'none');
+              core.setOutput('prerelease', 'false');
+              core.info('No previous releases found; will start at 1.0.0-alpha.1');
+            }
+
+      # ── Step B: compute the new version, channel, and versionCode ───────
+      - name: Compute version
+        id: calc
+        env:
+          GITHUB_REF:    ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version_name }}
+          BUMP_TYPE:     ${{ inputs.bump_type }}
+          FORCED_CH:     ${{ inputs.build_channel }}
+          PREV_TAG:      ${{ steps.prev.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # ════════════════════════════════════════════════════════════════
+          # HELPER: channel_from_suffix  <suffix>
+          # ════════════════════════════════════════════════════════════════
+          channel_from_suffix() {
+            local s="$1"
+            if   [[ -z "$s"              ]]; then echo "release"
+            elif [[ "$s" =~ ^rc          ]]; then echo "rc"
+            elif [[ "$s" =~ ^beta        ]]; then echo "beta"
+            elif [[ "$s" =~ ^alpha       ]]; then echo "alpha"
+            elif [[ "$s" =~ ^dev         ]]; then echo "dev"
+            elif [[ "$s" =~ ^bleeding    ]]; then echo "bleeding"
+            else                                  echo "alpha"
+            fi
+          }
+
+          # ════════════════════════════════════════════════════════════════
+          # HELPER: parse_version  <vX.Y.Z[-suffix]>  → sets globals
+          #         PMAJ  PMIN  PPATCH  PSUFFIX  PCHANNEL  PPRE
+          # ════════════════════════════════════════════════════════════════
+          parse_version() {
+            local raw="${1#v}"   # strip leading 'v'
+            if [[ "$raw" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-(.+))?$ ]]; then
+              PMAJ="${BASH_REMATCH[1]}"
+              PMIN="${BASH_REMATCH[2]}"
+              PPATCH="${BASH_REMATCH[3]}"
+              PSUFFIX="${BASH_REMATCH[5]:-}"
+            else
+              PMAJ=0; PMIN=0; PPATCH=0; PSUFFIX=""
+            fi
+            PCHANNEL="$(channel_from_suffix "$PSUFFIX")"
+            # Extract the trailing integer from the suffix (alpha.2 → 2, rc1 → 1)
+            PPRE="$(echo "$PSUFFIX" | grep -oP '\d+$' || echo '0')"
+            PPRE="${PPRE:-0}"
+          }
+
+          # ════════════════════════════════════════════════════════════════
+          # HELPER: next_channel  <channel>
+          # ════════════════════════════════════════════════════════════════
+          next_channel() {
+            case "$1" in
+              bleeding) echo "dev"     ;;
+              dev)      echo "alpha"   ;;
+              alpha)    echo "beta"    ;;
+              beta)     echo "rc"      ;;
+              rc)       echo "release" ;;
+              release)  echo "alpha"   ;;   # promote from stable → new patch alpha
+              *)        echo "alpha"   ;;
+            esac
+          }
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 1 – decide the raw version string
+          # ════════════════════════════════════════════════════════════════
+          AUTO_BUMPED="false"
+          BUMP_DESC="(version from tag/input)"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # ── Tag push: version IS the tag. No auto-bump.
+            VERSION="${GITHUB_REF#refs/tags/v}"
+
+          elif [[ -n "${INPUT_VERSION}" && "${INPUT_VERSION}" != "auto" ]]; then
+            # ── Explicit version_name supplied via workflow_dispatch
+            VERSION="${INPUT_VERSION}"
+
+          else
+            # ── Auto-bump from the previous release ──────────────────────
+            AUTO_BUMPED="true"
+            BUMP_TYPE="${BUMP_TYPE:-auto}"
+            FORCED_CH="${FORCED_CH:-auto}"
+
+            # Parse previous release
+            if [[ "${PREV_TAG}" == "none" || -z "${PREV_TAG}" ]]; then
+              # No prior release → bootstrap at 1.0.0-alpha.1
+              VERSION="1.0.0-alpha.1"
+              BUMP_DESC="No prior release found → bootstrapped at 1.0.0-alpha.1"
+            else
+              parse_version "${PREV_TAG}"
+              PREV_DISP="${PMAJ}.${PMIN}.${PPATCH}${PSUFFIX:+-$PSUFFIX}"
+
+              case "${BUMP_TYPE}" in
+
+                auto|increment)
+                  # Stay in same channel, increment pre-release counter.
+                  # Special case: if previous was stable, do patch bump → alpha.1
+                  if [[ "${PCHANNEL}" == "release" ]]; then
+                    NEW_PATCH=$(( PPATCH + 1 ))
+                    NEW_CH="${FORCED_CH}"
+                    [[ "${NEW_CH}" == "auto" ]] && NEW_CH="alpha"
+                    VERSION="${PMAJ}.${PMIN}.${NEW_PATCH}-${NEW_CH}.1"
+                    BUMP_DESC="Previous ${PREV_DISP} (stable) → patch bump to ${VERSION}"
+                  else
+                    NEW_PRE=$(( PPRE + 1 ))
+                    NEW_CH="${FORCED_CH}"
+                    [[ "${NEW_CH}" == "auto" ]] && NEW_CH="${PCHANNEL}"
+                    VERSION="${PMAJ}.${PMIN}.${PPATCH}-${NEW_CH}.${NEW_PRE}"
+                    BUMP_DESC="Previous ${PREV_DISP} (${PCHANNEL}) → incremented to ${VERSION}"
+                  fi
+                  ;;
+
+                promote)
+                  # Advance one step along the channel progression.
+                  NEXT_CH="$(next_channel "${PCHANNEL}")"
+                  # Allow forced_channel to override the promotion target
+                  [[ "${FORCED_CH}" != "auto" ]] && NEXT_CH="${FORCED_CH}"
+
+                  if [[ "${PCHANNEL}" == "release" ]]; then
+                    # promoting stable → patch bump then alpha
+                    NEW_PATCH=$(( PPATCH + 1 ))
+                    VERSION="${PMAJ}.${PMIN}.${NEW_PATCH}-${NEXT_CH}.1"
+                  elif [[ "${NEXT_CH}" == "release" ]]; then
+                    VERSION="${PMAJ}.${PMIN}.${PPATCH}"
+                  else
+                    VERSION="${PMAJ}.${PMIN}.${PPATCH}-${NEXT_CH}.1"
+                  fi
+                  BUMP_DESC="Previous ${PREV_DISP} (${PCHANNEL}) → promoted to ${VERSION} (${NEXT_CH})"
+                  ;;
+
+                patch)
+                  NEW_PATCH=$(( PPATCH + 1 ))
+                  NEW_CH="${FORCED_CH}"; [[ "${NEW_CH}" == "auto" ]] && NEW_CH="alpha"
+                  VERSION="${PMAJ}.${PMIN}.${NEW_PATCH}-${NEW_CH}.1"
+                  BUMP_DESC="Previous ${PREV_DISP} → patch bump → ${VERSION}"
+                  ;;
+
+                minor)
+                  NEW_MIN=$(( PMIN + 1 ))
+                  NEW_CH="${FORCED_CH}"; [[ "${NEW_CH}" == "auto" ]] && NEW_CH="alpha"
+                  VERSION="${PMAJ}.${NEW_MIN}.0-${NEW_CH}.1"
+                  BUMP_DESC="Previous ${PREV_DISP} → minor bump → ${VERSION}"
+                  ;;
+
+                major)
+                  NEW_MAJ=$(( PMAJ + 1 ))
+                  NEW_CH="${FORCED_CH}"; [[ "${NEW_CH}" == "auto" ]] && NEW_CH="alpha"
+                  VERSION="${NEW_MAJ}.0.0-${NEW_CH}.1"
+                  BUMP_DESC="Previous ${PREV_DISP} → major bump → ${VERSION}"
+                  ;;
+
+                *)
+                  VERSION="${PREV_DISP}"
+                  BUMP_DESC="(unknown bump_type '${BUMP_TYPE}', using prev version)"
+                  ;;
+              esac
+            fi
+          fi
+
+          echo "Resolved version: ${VERSION}"
+          echo "Bump: ${BUMP_DESC}"
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 2 – parse the resolved version into components
+          # ════════════════════════════════════════════════════════════════
+          if [[ "${VERSION}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-(.+))?$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            SUFFIX="${BASH_REMATCH[5]:-}"
+          else
+            MAJOR=0; MINOR=0; PATCH=0; SUFFIX="${VERSION}"
+          fi
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 3 – detect channel
+          # ════════════════════════════════════════════════════════════════
+          CHANNEL="$(channel_from_suffix "${SUFFIX}")"
+
+          # Explicit override from build_channel input (except on tag push)
+          FORCED_CH="${FORCED_CH:-auto}"
+          if [[ "${FORCED_CH}" != "auto" && "${GITHUB_REF}" != refs/tags/* ]]; then
+            CHANNEL="${FORCED_CH}"
+          fi
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 4 – extract pre-release number; cap at 99 for versionCode
+          # ════════════════════════════════════════════════════════════════
+          PRE_RAW="$(echo "${SUFFIX}" | grep -oP '\d+$' || echo '0')"
+          PRE_RAW="${PRE_RAW:-0}"
+          PRE_NUM=$(( PRE_RAW > 99 ? 99 : PRE_RAW ))
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 5 – compute versionCode
+          # MAJOR×10 000 000 + MINOR×100 000 + PATCH×1 000 + OFFSET + pre_num
+          # ════════════════════════════════════════════════════════════════
+          case "${CHANNEL}" in
+            bleeding) OFFSET=0   ;;
+            dev)      OFFSET=100 ;;
+            alpha)    OFFSET=200 ;;
+            beta)     OFFSET=400 ;;
+            rc)       OFFSET=600 ;;
+            release)  OFFSET=900 ;;
+            *)        OFFSET=200 ;;
+          esac
+          VERSION_CODE=$(( MAJOR * 10000000 + MINOR * 100000 + PATCH * 1000 + OFFSET + PRE_NUM ))
+
+          # ════════════════════════════════════════════════════════════════
+          # STEP 6 – channel metadata
+          # ════════════════════════════════════════════════════════════════
+          case "${CHANNEL}" in
+            release)
+              IS_PRERELEASE="false"; BUILD_AAB="true";  RETENTION=90
+              LABEL="Stable Release";    EMOJI="🚀" ;;
+            rc)
+              IS_PRERELEASE="true";  BUILD_AAB="true";  RETENTION=60
+              LABEL="Release Candidate"; EMOJI="🔖" ;;
+            beta)
+              IS_PRERELEASE="true";  BUILD_AAB="true";  RETENTION=45
+              LABEL="Beta";              EMOJI="🧪" ;;
+            alpha)
+              IS_PRERELEASE="true";  BUILD_AAB="false"; RETENTION=30
+              LABEL="Alpha";             EMOJI="🔬" ;;
+            dev)
+              IS_PRERELEASE="true";  BUILD_AAB="false"; RETENTION=14
+              LABEL="Dev Snapshot";      EMOJI="🛠️" ;;
+            bleeding)
+              IS_PRERELEASE="true";  BUILD_AAB="false"; RETENTION=7
+              LABEL="Bleeding Edge";     EMOJI="🩸" ;;
+          esac
+
+          # Store previous-release info for release notes
+          PREV_VERSION="${PREV_TAG#v}"
+          PREV_CHANNEL="$(channel_from_suffix "$(echo "${PREV_VERSION}" | grep -oP '(?<=[0-9]-).*' || echo '')")"
+
+          # ════════════════════════════════════════════════════════════════
+          # EMIT OUTPUTS
+          # ════════════════════════════════════════════════════════════════
+          {
+            echo "version_name=${VERSION}"
+            echo "version_code=${VERSION_CODE}"
+            echo "channel=${CHANNEL}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "build_aab=${BUILD_AAB}"
+            echo "retention_days=${RETENTION}"
+            echo "channel_label=${LABEL}"
+            echo "channel_emoji=${EMOJI}"
+            echo "prev_version=${PREV_VERSION}"
+            echo "prev_channel=${PREV_CHANNEL}"
+            echo "bump_description=${BUMP_DESC}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "══════════════════════════════════════════════════════"
+          echo "  Previous release : ${PREV_VERSION} (${PREV_CHANNEL})"
+          echo "  Bump applied      : ${BUMP_DESC}"
+          echo "  ───────────────────────────────────────────────────"
+          echo "  New version       : ${VERSION}"
+          echo "  versionCode       : ${VERSION_CODE}"
+          echo "  Channel           : ${CHANNEL} (${LABEL} ${EMOJI})"
+          echo "  Is pre-release    : ${IS_PRERELEASE}"
+          echo "  Build AAB         : ${BUILD_AAB}"
+          echo "  Artifact retention: ${RETENTION} days"
+          echo "══════════════════════════════════════════════════════"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. VALIDATE — compile + unit tests must pass before packaging
+  # ══════════════════════════════════════════════════════════════════════════
+  validate:
+    name: "Validate: compile + tests"
+    runs-on: ubuntu-latest
+    needs: resolve
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: gradle
+
+      - name: Configure Android SDK location
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_DIR" > android/local.properties
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses 2>/dev/null || \
+          yes | "$SDK_DIR/tools/bin/sdkmanager"                --licenses 2>/dev/null || \
+          echo "License acceptance skipped (sdkmanager not found or licenses already accepted)"
+
+      - name: Grant Gradle execute permission
+        working-directory: android
+        run: chmod +x gradlew
+
+      - name: Run unit tests
+        working-directory: android
+        run: ./gradlew test --no-daemon
+
+      - name: Android Lint (non-blocking)
+        working-directory: android
+        run: ./gradlew lintRelease --no-daemon
+        continue-on-error: true
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            android-lint-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version_name }}
+          path: android/app/build/reports/lint-results-release.html
+          retention-days: ${{ needs.resolve.outputs.retention_days }}
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. BUILD APK — every channel gets an APK
+  # ══════════════════════════════════════════════════════════════════════════
+  build-apk:
+    name: >-
+      Build APK
+      [${{ needs.resolve.outputs.channel_emoji }} ${{ needs.resolve.outputs.channel_label }}
+      v${{ needs.resolve.outputs.version_name }}]
+    runs-on: ubuntu-latest
+    needs: [resolve, validate]
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: gradle
+
+      - name: Configure Android SDK location
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_DIR" > android/local.properties
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses 2>/dev/null || \
+          yes | "$SDK_DIR/tools/bin/sdkmanager"                --licenses 2>/dev/null || \
+          echo "License acceptance skipped (sdkmanager not found or licenses already accepted)"
+
+      - name: Grant Gradle execute permission
+        working-directory: android
+        run: chmod +x gradlew
+
+      - name: Decode keystore
+        id: keystore
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/wscanplus-release.jks
+          echo "keystore_available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write keystore.properties
+        if: steps.keystore.outputs.keystore_available == 'true'
+        run: |
+          cat > android/keystore.properties << EOF
+          storeFile=wscanplus-release.jks
+          storePassword=${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          keyAlias=${{ secrets.KEYSTORE_KEY_ALIAS }}
+          keyPassword=${{ secrets.KEYSTORE_KEY_PASSWORD }}
+          EOF
+
+      - name: Assemble release APK
+        working-directory: android
+        run: |
+          ./gradlew assembleRelease --no-daemon \
+            -PversionName="${{ needs.resolve.outputs.version_name }}" \
+            -PversionCode="${{ needs.resolve.outputs.version_code }}"
+
+      - name: Rename APK (embed channel + version)
+        run: |
+          SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          DEST="android/app/build/outputs/apk/release/wscanplus-${{ needs.resolve.outputs.version_name }}-${{ needs.resolve.outputs.channel }}.apk"
+          mv "$SRC" "$DEST"
+          echo "APK: $DEST"
+
+      - name: Verify APK signature
+        if: steps.keystore.outputs.keystore_available == 'true'
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          $ANDROID_HOME/build-tools/35.0.0/apksigner verify --verbose "$APK" 2>&1 || true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            wscanplus-apk-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version_name }}
+          path: android/app/build/outputs/apk/release/*.apk
+          retention-days: ${{ needs.resolve.outputs.retention_days }}
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3. BUILD AAB — only for release / rc / beta (Play Store upload tracks)
+  # ══════════════════════════════════════════════════════════════════════════
+  build-aab:
+    name: >-
+      Build AAB (Play Store)
+      [${{ needs.resolve.outputs.channel_emoji }} ${{ needs.resolve.outputs.channel_label }}]
+    runs-on: ubuntu-latest
+    needs: [resolve, validate]
+    if: needs.resolve.outputs.build_aab == 'true'
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: gradle
+
+      - name: Configure Android SDK location
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "sdk.dir=$SDK_DIR" > android/local.properties
+
+      - name: Accept Android SDK licenses
+        run: |
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses 2>/dev/null || \
+          yes | "$SDK_DIR/tools/bin/sdkmanager"                --licenses 2>/dev/null || \
+          echo "License acceptance skipped (sdkmanager not found or licenses already accepted)"
+
+      - name: Grant Gradle execute permission
+        working-directory: android
+        run: chmod +x gradlew
+
+      - name: Decode keystore
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/wscanplus-release.jks
+
+      - name: Write keystore.properties
+        if: env.HAS_KEYSTORE == 'true'
+        run: |
+          cat > android/keystore.properties << EOF
+          storeFile=wscanplus-release.jks
+          storePassword=${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          keyAlias=${{ secrets.KEYSTORE_KEY_ALIAS }}
+          keyPassword=${{ secrets.KEYSTORE_KEY_PASSWORD }}
+          EOF
+
+      - name: Bundle release AAB
+        working-directory: android
+        run: |
+          ./gradlew bundleRelease --no-daemon \
+            -PversionName="${{ needs.resolve.outputs.version_name }}" \
+            -PversionCode="${{ needs.resolve.outputs.version_code }}"
+
+      - name: Rename AAB
+        run: |
+          SRC=$(find android/app/build/outputs/bundle/release -name "*.aab" | head -1)
+          DEST="android/app/build/outputs/bundle/release/wscanplus-${{ needs.resolve.outputs.version_name }}-${{ needs.resolve.outputs.channel }}.aab"
+          mv "$SRC" "$DEST"
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            wscanplus-aab-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version_name }}
+          path: android/app/build/outputs/bundle/release/*.aab
+          retention-days: ${{ needs.resolve.outputs.retention_days }}
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 4. GITHUB RELEASE — channel-aware draft with full build provenance
+  # ══════════════════════════════════════════════════════════════════════════
+  create-github-release:
+    name: "Create GitHub Release Draft"
+    runs-on: ubuntu-latest
+    needs: [resolve, build-apk, build-aab]
+    if: >
+      always() &&
+      needs.build-apk.result == 'success' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       inputs.create_release == 'true')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: >-
+            wscanplus-apk-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version_name }}
+          path: dist/apk/
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        continue-on-error: true   # skipped for alpha/dev/bleeding
+        with:
+          name: >-
+            wscanplus-aab-${{ needs.resolve.outputs.channel }}-${{ needs.resolve.outputs.version_name }}
+          path: dist/aab/
+
+      - name: Write build-confirmed marker
+        # Only emit for stable / rc — this is the asset UpdateChecker checks for.
+        if: >
+          needs.resolve.outputs.channel == 'release' ||
+          needs.resolve.outputs.channel == 'rc'
+        run: |
+          mkdir -p dist
+          {
+            echo "Build confirmed on $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "Version: ${{ needs.resolve.outputs.version_name }}"
+            echo "Channel: ${{ needs.resolve.outputs.channel }}"
+            echo "Commit:  ${{ github.sha }}"
+            echo "Run:     ${{ github.run_id }}"
+          } > dist/build-confirmed.txt
+
+      - name: Generate release notes
+        run: |
+          VERSION="${{ needs.resolve.outputs.version_name }}"
+          CHANNEL="${{ needs.resolve.outputs.channel }}"
+          LABEL="${{ needs.resolve.outputs.channel_label }}"
+          EMOJI="${{ needs.resolve.outputs.channel_emoji }}"
+          PREV="${{ needs.resolve.outputs.prev_version }}"
+          PREV_CH="${{ needs.resolve.outputs.prev_channel }}"
+          BUMP="${{ needs.resolve.outputs.bump_description }}"
+
+          case "${CHANNEL}" in
+            release)  STABILITY="**Stable release.** Recommended for all users."        WARN="" ;;
+            rc)       STABILITY="**Release Candidate** — feature-complete, final testing." WARN="> ⚠️ RC: not recommended for primary devices." ;;
+            beta)     STABILITY="**Beta build** — mostly stable, some rough edges."       WARN="> ⚠️ Beta: may contain bugs." ;;
+            alpha)    STABILITY="**Alpha build** — early preview, expect crashes."        WARN="> 🔬 Alpha: internal testing only." ;;
+            dev)      STABILITY="**Dev snapshot** — may be incomplete or broken."         WARN="> 🛠️ Dev: for developers only." ;;
+            bleeding) STABILITY="**Bleeding edge** — latest uncommitted changes."         WARN="> 🩸 Bleeding: highly experimental." ;;
+          esac
+
+          CHECKSUMS="$(sha256sum dist/apk/*.apk dist/aab/*.aab 2>/dev/null || echo '(not available)')"
+
+          cat << EOF > release_notes.md
+          ## ${EMOJI} wscan+ v${VERSION} — ${LABEL}
+
+          ${STABILITY}
+
+          ${WARN}
+
+          ---
+
+          ### 🔄 Version history
+          | Field | Value |
+          |---|---|
+          | Previous release | \`${PREV}\` (${PREV_CH}) |
+          | This version | \`${VERSION}\` (${CHANNEL}) |
+          | Bump applied | ${BUMP} |
+
+          ### 📦 Assets
+          | File | Description |
+          |---|---|
+          | \`wscanplus-${VERSION}-${CHANNEL}.apk\` | APK — sideload on any Android device |
+          $([ "${CHANNEL}" = "release" ] || [ "${CHANNEL}" = "rc" ] || [ "${CHANNEL}" = "beta" ] && echo "| \`wscanplus-${VERSION}-${CHANNEL}.aab\` | App Bundle — Play Store submission |" || true)
+          $([ "${CHANNEL}" = "release" ] || [ "${CHANNEL}" = "rc" ] && echo "| \`build-confirmed.txt\` | CI build-confirmation marker for in-app update checker |" || true)
+
+          ### 📲 Sideload instructions
+          1. Enable **Install unknown apps** in **Settings → Apps → your browser**.
+          2. Download the APK from the assets below and tap it to install.
+          3. Grant Location, Wi-Fi and Storage permissions when prompted.
+
+          ### 🔢 Build provenance
+          | Field | Value |
+          |---|---|
+          | versionName | \`${VERSION}\` |
+          | versionCode | \`${{ needs.resolve.outputs.version_code }}\` |
+          | Channel | \`${CHANNEL}\` |
+          | Commit | [\`${{ github.sha }}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |
+          | Build run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ### 🔒 SHA-256 checksums
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+          EOF
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', needs.resolve.outputs.version_name) }}
+          name: "wscan+ v${{ needs.resolve.outputs.version_name }} — ${{ needs.resolve.outputs.channel_label }}"
+          body_path: release_notes.md
+          draft: true
+          prerelease: ${{ needs.resolve.outputs.is_prerelease == 'true' }}
+          files: |
+            dist/apk/*.apk
+            dist/aab/*.aab
+            dist/build-confirmed.txt

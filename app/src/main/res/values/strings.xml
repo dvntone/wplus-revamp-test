@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">wscan+</string>
+    <string name="scan_status_idle">Idle — press Start Scan to begin</string>
+    <string name="scan_status_active">Scanning for Wi-Fi attacks…</string>
+    <string name="notification_channel_name">Wi-Fi IDS Scanning</string>
+    <string name="notification_channel_desc">wscan+ is actively monitoring for Wi-Fi attacks</string>
+    <!-- Settings screen -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_firebase_section">Cloud Sync (Firebase)</string>
+    <string name="settings_ai_section">AI Analysis (Gemini)</string>
+    <string name="settings_companion_section">Companion Desktop App</string>
+    <string name="settings_save">Save Settings</string>
+    <string name="settings_saved_toast">Settings saved</string>
+    <!-- AI screen -->
+    <string name="ai_title">AI Threat Analysis</string>
+    <string name="ai_analyse_button">Analyse Threats with Gemini</string>
+    <string name="ai_no_key">No Gemini API key found. Please add one in Settings.</string>
+    <string name="ai_no_logs">No threat logs found. Run a scan first.</string>
+</resources>

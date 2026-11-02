@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    USB device filter for wscan+ Wi-Fi adapter detection.
+
+    This file limits ACTION_USB_DEVICE_ATTACHED broadcasts to USB devices that
+    match at least one of the listed entries. It is referenced from the
+    UsbWifiAdapterReceiver <meta-data> in AndroidManifest.xml.
+
+    vendor-id and product-id are specified in DECIMAL (not hex).
+
+    Conversion reference (hex → decimal):
+      0x0CF3 = 3315  (Qualcomm Atheros)
+      0x0BDA = 3034  (Realtek Semiconductor)
+      0x0E8D = 3725  (MediaTek / Ralink)
+      0x148F = 5263  (Ralink Technology)
+      0x2357 = 9047  (TP-Link)
+      0x7392 = 29586 (Edimax Technology)
+
+    Devices not listed here will still trigger ACTION_USB_DEVICE_ATTACHED
+    globally, but this filter prevents the system from showing the "Open with
+    wscan+" dialog for unrelated USB devices.
+-->
+<resources>
+    <!-- ── Qualcomm Atheros ─────────────────────────────────────────────── -->
+    <!-- AR9271 – Alfa AWUS036NHA, TP-Link TL-WN722N v1                     -->
+    <usb-device vendor-id="3315" product-id="37489" />
+    <!-- AR9287                                                              -->
+    <usb-device vendor-id="3315" product-id="28693" />
+
+    <!-- ── Realtek Semiconductor ───────────────────────────────────────── -->
+    <!-- RTL8187L                                                            -->
+    <usb-device vendor-id="3034" product-id="33159" />
+    <!-- RTL8188EU – TP-Link TL-WN725N v2/v3                                -->
+    <usb-device vendor-id="3034" product-id="33145" />
+    <!-- RTL8192EU                                                           -->
+    <usb-device vendor-id="3034" product-id="33424" />
+    <!-- RTL8812AU – Alfa AWUS036ACH, ASUS USB-AC56                         -->
+    <usb-device vendor-id="3034" product-id="34842" />
+    <!-- RTL8814AU                                                           -->
+    <usb-device vendor-id="3034" product-id="34836" />
+
+    <!-- ── MediaTek / Ralink (VID 0x0E8D) ─────────────────────────────── -->
+    <!-- MT7601U – budget adapters                                          -->
+    <usb-device vendor-id="3725" product-id="30209" />
+    <!-- RT2870 / RT3070                                                     -->
+    <usb-device vendor-id="3725" product-id="10352" />
+
+    <!-- ── Ralink Technology (VID 0x148F) ─────────────────────────────── -->
+    <!-- RT3070 – D-Link DWA-127                                            -->
+    <usb-device vendor-id="5263" product-id="12400" />
+    <!-- RT5370 – Raspberry Pi Wi-Fi dongle                                 -->
+    <usb-device vendor-id="5263" product-id="21360" />
+
+    <!-- ── TP-Link (VID 0x2357) ────────────────────────────────────────── -->
+    <!-- TL-WN823N v3                                                        -->
+    <usb-device vendor-id="9047" product-id="265" />
+
+    <!-- ── Edimax (VID 0x7392) ─────────────────────────────────────────── -->
+    <!-- EW-7811Un (RTL8188CUS)                                              -->
+    <usb-device vendor-id="29586" product-id="30737" />
+</resources>

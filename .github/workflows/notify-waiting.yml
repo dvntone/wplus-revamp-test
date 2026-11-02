@@ -1,0 +1,317 @@
+name: Needs Attention – Notify on Blocked / Failing Checks
+
+# ── Purpose ────────────────────────────────────────────────────────────────────
+# This workflow fires whenever any other workflow in this repository finishes
+# with a failure or is skipped because of missing configuration.
+#
+# It analyses the failure, decides whether it requires owner action (missing
+# secrets, pending approvals, configuration gaps) and, if so, posts a
+# structured comment on the associated Pull Request so the owner is notified
+# immediately without having to dig through logs.
+#
+# ── What it detects ────────────────────────────────────────────────────────────
+#   • Missing repository secrets  (KEYSTORE_BASE64, SONAR_TOKEN, etc.)
+#   • Missing repository variables (SONAR_ORGANIZATION)
+#   • Workflow waiting for manual approval / environment protection
+#   • Build compile errors requiring code fixes
+#   • Android lint / ktlint issues blocking the quality gate
+#
+# ── Permissions needed ─────────────────────────────────────────────────────────
+# For the PR comment to be posted the workflow token needs:
+#   pull-requests: write
+#   issues:        write
+# See REQUIRED_SETUP.md for how to grant these.
+
+on:
+  workflow_run:
+    workflows:
+      - "Android CI"
+      - "Windows CI"
+      - "Android Release & Deploy"
+      - "Code Quality Gate"
+      - "SonarCloud Analysis"
+    types: [completed]
+
+  # Also allow manual trigger to re-check the current state.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Workflow run ID to inspect (leave blank to check latest)"
+        required: false
+        default: ""
+
+permissions:
+  pull-requests: write
+  issues:        write
+  contents:      read
+  actions:       read   # needed to read workflow-run logs
+
+jobs:
+  notify:
+    name: Analyse failure & notify owner
+    runs-on: ubuntu-latest
+    # Only run when a workflow actually completed
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure' ||
+      github.event.workflow_run.conclusion == 'action_required'
+
+    steps:
+      - name: Analyse run and post notification
+        uses: actions/github-script@v7
+        with:
+          # Give the token pull-requests:write scope
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // ────────────────────────────────────────────────────────────────
+            // 1. Determine which run to inspect
+            // ────────────────────────────────────────────────────────────────
+            const manualRunId = '${{ inputs.run_id }}';
+            const runId = manualRunId
+              ? parseInt(manualRunId)
+              : context.payload.workflow_run?.id;
+
+            if (!runId) {
+              core.info('No run ID available – skipping.');
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            // Fetch the run details
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: runId,
+            });
+
+            core.info(`Inspecting run ${runId}: ${run.name} → ${run.conclusion}`);
+
+            // ────────────────────────────────────────────────────────────────
+            // 2. Collect failed job logs (tail 120 lines per job)
+            // ────────────────────────────────────────────────────────────────
+            const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+              owner, repo, run_id: runId, filter: 'latest',
+            });
+
+            const failedJobs = jobsData.jobs.filter(j => j.conclusion === 'failure');
+
+            // Extract error lines from step names / conclusion messages
+            const errorLines = [];
+            for (const job of failedJobs) {
+              for (const step of job.steps || []) {
+                if (step.conclusion === 'failure') {
+                  errorLines.push(`**${job.name}** › **${step.name}**`);
+                }
+              }
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // 3. Classify the failure type
+            // ────────────────────────────────────────────────────────────────
+            const workflowName = run.name || '';
+            const failedStepNames = errorLines.join(' ').toLowerCase();
+
+            // --- Known missing-secret signatures ---
+            const missingSecrets = [];
+            const missingVars    = [];
+
+            if (workflowName.includes('SonarCloud') ||
+                workflowName.includes('Code Quality')) {
+              if (!process.env.SONAR_TOKEN_PRESENT) {
+                missingSecrets.push({
+                  secret: 'SONAR_TOKEN',
+                  where:  'https://sonarcloud.io → My Account → Security → Generate Token',
+                  why:    'Required for SonarCloud static-analysis and security scans.',
+                });
+                missingVars.push({
+                  variable: 'SONAR_ORGANIZATION',
+                  value:    'Your SonarCloud organization slug (e.g. `dvntone`)',
+                  why:      'Identifies your SonarCloud org. Set in repo Settings → Variables.',
+                });
+              }
+            }
+
+            if (workflowName.includes('Android Release') ||
+                workflowName.includes('Android CI')) {
+              // APK signing secrets — missing these is not fatal (unsigned APK
+              // is produced instead) but we flag them so the owner knows.
+              missingSecrets.push({
+                secret: 'KEYSTORE_BASE64',
+                where:  'base64-encode your release .jks file: `base64 -w0 release.jks`',
+                why:    'Required to produce a signed release APK / AAB. Without it, builds produce unsigned APKs.',
+                optional: true,
+              });
+              missingSecrets.push({
+                secret: 'KEYSTORE_STORE_PASSWORD',
+                where:  'The keystore file password (set when you created the keystore)',
+                why:    'Required alongside KEYSTORE_BASE64 for APK signing.',
+                optional: true,
+              });
+              missingSecrets.push({
+                secret: 'KEYSTORE_KEY_ALIAS',
+                where:  'The alias name inside your keystore file',
+                why:    'Required alongside KEYSTORE_BASE64 for APK signing.',
+                optional: true,
+              });
+              missingSecrets.push({
+                secret: 'KEYSTORE_KEY_PASSWORD',
+                where:  'The key password (may be same as store password)',
+                why:    'Required alongside KEYSTORE_BASE64 for APK signing.',
+                optional: true,
+              });
+            }
+
+            // Filter to required-only for the urgent section
+            const requiredMissing = missingSecrets.filter(s => !s.optional);
+
+            // ────────────────────────────────────────────────────────────────
+            // 4. Find the pull request associated with this run
+            // ────────────────────────────────────────────────────────────────
+            const branch = run.head_branch;
+            const sha    = run.head_sha;
+
+            let prNumber = null;
+
+            // Try the PRs linked in the run payload first
+            const linkedPRs = run.pull_requests || [];
+            if (linkedPRs.length > 0) {
+              prNumber = linkedPRs[0].number;
+            } else {
+              // Fall back to searching open PRs for this branch
+              const { data: prs } = await github.rest.pulls.list({
+                owner, repo, state: 'open', head: `${owner}:${branch}`,
+              });
+              if (prs.length > 0) prNumber = prs[0].number;
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // 5. Build the notification body
+            // ────────────────────────────────────────────────────────────────
+            const runUrl  = run.html_url;
+            const marker  = '<!-- wscanplus-needs-attention -->';
+
+            let body = `${marker}\n`;
+            body += `## ⚠️ Action Required — ${workflowName} failed\n\n`;
+            body += `> Automated alert from the **Needs Attention** workflow.  \n`;
+            body += `> Run: [${run.name} #${run.run_number}](${runUrl}) • Branch: \`${branch}\`\n\n`;
+
+            // ── Failed steps ──────────────────────────────────────────────
+            if (errorLines.length > 0) {
+              body += `### ❌ Failed steps\n`;
+              for (const line of errorLines) body += `- ${line}\n`;
+              body += '\n';
+            }
+
+            // ── Required actions ──────────────────────────────────────────
+            body += `### 🔧 What to do\n\n`;
+
+            if (failedStepNames.includes('compile') ||
+                failedStepNames.includes('build') ||
+                failedStepNames.includes('test')) {
+              body += `**→ Code fix required.** A compile error or test failure was detected.\n`;
+              body += `Check the [full logs](${runUrl}) for the exact error message and file/line number.\n\n`;
+            }
+
+            if (requiredMissing.length > 0) {
+              body += `**→ Missing required secrets.** Please add these in `;
+              body += `[Settings → Secrets → Actions](https://github.com/${owner}/${repo}/settings/secrets/actions):\n\n`;
+              for (const s of requiredMissing) {
+                body += `| Secret | Why needed | Where to get it |\n|---|---|---|\n`;
+                body += `| \`${s.secret}\` | ${s.why} | ${s.where} |\n\n`;
+              }
+            }
+
+            if (missingVars.length > 0) {
+              body += `**→ Missing repository variables.** Add in `;
+              body += `[Settings → Variables → Actions](https://github.com/${owner}/${repo}/settings/variables/actions):\n\n`;
+              for (const v of missingVars) {
+                body += `| Variable | Value | Why |\n|---|---|---|\n`;
+                body += `| \`${v.variable}\` | ${v.value} | ${v.why} |\n\n`;
+              }
+            }
+
+            // ── Optional signing secrets notice ───────────────────────────
+            const optionalSecrets = missingSecrets.filter(s => s.optional);
+            if (optionalSecrets.length > 0 && workflowName.includes('Release')) {
+              body += `<details>\n<summary>📦 Optional: APK signing secrets (needed for signed release builds)</summary>\n\n`;
+              body += `Without these the release pipeline produces an **unsigned APK** (fine for testing, `;
+              body += `not for Play Store). Configure in [Settings → Secrets](https://github.com/${owner}/${repo}/settings/secrets/actions):\n\n`;
+              body += `| Secret | Description |\n|---|---|\n`;
+              for (const s of optionalSecrets) {
+                body += `| \`${s.secret}\` | ${s.why} |\n`;
+              }
+              body += `\nSee \`android/keystore.properties.template\` for the full setup guide.\n`;
+              body += `</details>\n\n`;
+            }
+
+            // ── Reference ─────────────────────────────────────────────────
+            body += `---\n`;
+            body += `📖 Full setup guide: [\`REQUIRED_SETUP.md\`](https://github.com/${owner}/${repo}/blob/main/REQUIRED_SETUP.md)\n`;
+
+            // ────────────────────────────────────────────────────────────────
+            // 6. Post or update the comment
+            // ────────────────────────────────────────────────────────────────
+            if (prNumber) {
+              // Check for an existing notification comment from this workflow
+              const { data: comments } = await github.rest.issues.listComments({
+                owner, repo, issue_number: prNumber,
+              });
+              const existing = comments.find(c =>
+                c.user.type === 'Bot' && c.body.includes(marker)
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner, repo,
+                  comment_id: existing.id,
+                  body,
+                });
+                core.info(`Updated existing notification on PR #${prNumber}`);
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo,
+                  issue_number: prNumber,
+                  body,
+                });
+                core.info(`Posted new notification on PR #${prNumber}`);
+              }
+            } else {
+              // No open PR — open/update a dedicated tracking issue instead
+              const issueTitle = `⚠️ CI failure needs attention: ${workflowName} on \`${branch}\``;
+
+              const { data: issues } = await github.rest.issues.listForRepo({
+                owner, repo, state: 'open',
+                labels: 'ci-attention',
+              });
+              const existing = issues.find(i => i.title === issueTitle);
+
+              if (existing) {
+                await github.rest.issues.createComment({
+                  owner, repo,
+                  issue_number: existing.number,
+                  body,
+                });
+                core.info(`Commented on existing issue #${existing.number}`);
+              } else {
+                // Ensure the label exists before creating the issue
+                try {
+                  await github.rest.issues.getLabel({ owner, repo, name: 'ci-attention' });
+                } catch {
+                  await github.rest.issues.createLabel({
+                    owner, repo,
+                    name:  'ci-attention',
+                    color: 'e11d48',
+                    description: 'CI failure or configuration gap requires owner action',
+                  });
+                }
+                const { data: newIssue } = await github.rest.issues.create({
+                  owner, repo,
+                  title:  issueTitle,
+                  body,
+                  labels: ['ci-attention'],
+                });
+                core.info(`Created issue #${newIssue.number}: ${issueTitle}`);
+              }
+            }
+
+            core.info('Notification delivered.');

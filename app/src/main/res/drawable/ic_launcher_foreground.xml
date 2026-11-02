@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon foreground: Wi-Fi signal icon representing wireless scanning -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer arc -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,34 A28,28 0 0,1 82,62 L78,62 A24,24 0 0,0 54,38 A24,24 0 0,0 30,62 L26,62 A28,28 0 0,1 54,34 Z" />
+    <!-- Middle arc -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,44 A18,18 0 0,1 72,62 L68,62 A14,14 0 0,0 54,48 A14,14 0 0,0 40,62 L36,62 A18,18 0 0,1 54,44 Z" />
+    <!-- Inner arc -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,54 A8,8 0 0,1 62,62 L58,62 A4,4 0 0,0 54,58 A4,4 0 0,0 50,62 L46,62 A8,8 0 0,1 54,54 Z" />
+    <!-- Dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,68m-4,0a4,4 0 1,0 8,0a4,4 0 1,0 -8,0" />
+    <!-- Shield outline for IDS concept -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2"
+        android:fillColor="@android:color/transparent"
+        android:pathData="M54,20 L72,26 L72,44 A18,18 0 0,1 54,62 A18,18 0 0,1 36,44 L36,26 Z" />
+</vector>

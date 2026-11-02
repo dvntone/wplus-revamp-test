@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>wscan+ | Wi-Fi Intrusion Detection System</title>
+  <meta name="description"
+    content="wscan+ is a cross-platform Wi-Fi Intrusion Detection System (WIDS) for Windows and Android, detecting Evil Twin, Deauth Flood, PMKID Sniffing, and KRACK attacks." />
+  <style>
+    :root {
+      --primary: #006495;
+      --primary-dark: #004B70;
+      --accent: #CAE6FF;
+      --bg: #f6fafe;
+      --card: #ffffff;
+      --text: #1a1a2e;
+      --muted: #555;
+      --border: #d0e4f0;
+      --high:   #c0392b;
+      --medium: #d35400;
+      --low:    #27ae60;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--primary);
+      color: white;
+      padding: 60px 24px 40px;
+      text-align: center;
+    }
+    header h1 { font-size: 2.8rem; font-weight: 700; letter-spacing: -0.5px; }
+    header p  { font-size: 1.15rem; opacity: .85; margin-top: 10px; max-width: 560px; margin-inline: auto; }
+    .badge-row { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 18px; }
+    .badge-row img { height: 22px; }
+
+    /* ── Buttons ── */
+    .cta-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 24px; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 10px 22px; border-radius: 6px; font-weight: 600;
+      font-size: .95rem; text-decoration: none; transition: opacity .15s;
+    }
+    .btn:hover { opacity: .85; }
+    .btn-primary { background: white; color: var(--primary); }
+    .btn-outline { background: transparent; color: white; border: 2px solid rgba(255,255,255,.7); }
+
+    /* ── Sections ── */
+    section { padding: 56px 24px; max-width: 900px; margin: 0 auto; }
+    h2 { font-size: 1.6rem; color: var(--primary); margin-bottom: 20px; }
+    h3 { font-size: 1.1rem; margin-bottom: 8px; }
+
+    /* ── Cards ── */
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 10px; padding: 20px;
+    }
+    .card .icon { font-size: 1.8rem; margin-bottom: 10px; }
+
+    /* ── Threat table ── */
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { padding: 10px 14px; border-bottom: 1px solid var(--border); text-align: left; }
+    th { background: var(--primary); color: white; }
+    tr:nth-child(even) td { background: #f0f7fd; }
+    .sev-high   { color: var(--high);   font-weight: 700; }
+    .sev-medium { color: var(--medium); font-weight: 700; }
+
+    /* ── Architecture diagram ── */
+    .arch {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 10px; padding: 24px; text-align: center; font-size: .95rem;
+    }
+    .arch pre { font-family: "Courier New", monospace; font-size: .85rem; line-height: 1.7; text-align: left; display: inline-block; }
+
+    /* ── Release ── */
+    .release-block {
+      background: var(--card); border-left: 4px solid var(--primary);
+      border-radius: 0 8px 8px 0; padding: 16px 20px; margin-bottom: 16px;
+    }
+    .release-block code { background: var(--accent); padding: 2px 6px; border-radius: 4px; font-size: .85rem; }
+
+    /* ── Footer ── */
+    footer {
+      background: var(--primary-dark); color: rgba(255,255,255,.75);
+      text-align: center; padding: 28px;
+      font-size: .87rem;
+    }
+    footer a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════ HEADER ══════ -->
+<header>
+  <h1>📡 wscan+</h1>
+  <p>Cross-platform Wi-Fi Intrusion Detection System for Windows &amp; Android</p>
+
+  <div class="badge-row">
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Android-blue?style=flat-square" alt="Platform" />
+    <img src="https://img.shields.io/badge/license-CC0--1.0-lightgrey?style=flat-square" alt="License" />
+    <img src="https://img.shields.io/badge/version-1.0.0-green?style=flat-square" alt="Version" />
+    <img src="https://img.shields.io/badge/AI-Gemini%20Ready-orange?style=flat-square" alt="AI Ready" />
+  </div>
+
+  <div class="cta-row">
+    <a class="btn btn-primary" href="https://github.com/dvntone/wscanPLUS/releases">⬇ Download</a>
+    <a class="btn btn-outline" href="https://github.com/dvntone/wscanPLUS">GitHub</a>
+    <a class="btn btn-outline" href="https://github.com/dvntone/wscanPLUS/blob/main/CHANGELOG.md">Changelog</a>
+  </div>
+</header>
+
+<!-- ══════════════════════════════════════════ FEATURES ══════ -->
+<section>
+  <h2>Features</h2>
+  <div class="card-grid">
+
+    <div class="card">
+      <div class="icon">🛡️</div>
+      <h3>Attack Heuristics</h3>
+      <p>Detects Evil Twin / Karma, Deauth Flooding, PMKID Sniffing, and KRACK in real time.</p>
+    </div>
+
+    <div class="card">
+      <div class="icon">🤖</div>
+      <h3>Gemini AI Analysis</h3>
+      <p>Send threat logs to Google Gemini for natural-language risk assessment and mitigation advice.</p>
+    </div>
+
+    <div class="card">
+      <div class="icon">🔗</div>
+      <h3>Companion Mode</h3>
+      <p>Android app forwards mobile scan results to the Windows desktop via a local HTTP relay for combined analysis.</p>
+    </div>
+
+    <div class="card">
+      <div class="icon">☁️</div>
+      <h3>Cloud Sync</h3>
+      <p>Firebase Realtime Database / Firestore sync keeps threat logs available across devices.</p>
+    </div>
+
+    <div class="card">
+      <div class="icon">📊</div>
+      <h3>Export</h3>
+      <p>Export threat logs to <code>.csv</code> or raw captures to <code>.pcap</code> (Wireshark-compatible).</p>
+    </div>
+
+    <div class="card">
+      <div class="icon">🔍</div>
+      <h3>OUI Lookup</h3>
+      <p>Local IEEE OUI SQLite database flags vendor mismatches — a key indicator of MAC spoofing.</p>
+    </div>
+
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════ ATTACKS ══════ -->
+<section>
+  <h2>Detected Attack Types</h2>
+  <table>
+    <thead>
+      <tr><th>Attack</th><th>Detection Method</th><th>Severity</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Evil Twin / Karma</strong></td>
+        <td>Duplicate SSID broadcasting from a new BSSID; optional OUI mismatch</td>
+        <td class="sev-high">HIGH</td>
+      </tr>
+      <tr>
+        <td><strong>Deauth Flood</strong></td>
+        <td>≥15 Deauth/Disassoc frames within a 10-second window per BSSID</td>
+        <td class="sev-high">HIGH / <span class="sev-medium">MEDIUM</span></td>
+      </tr>
+      <tr>
+        <td><strong>PMKID Sniffing</strong></td>
+        <td>EAPOL Handshake M1 from an unassociated client MAC</td>
+        <td class="sev-medium">MEDIUM</td>
+      </tr>
+      <tr>
+        <td><strong>KRACK</strong></td>
+        <td>Duplicate EAPOL Handshake M3 replay counter (nonce reuse)</td>
+        <td class="sev-high">HIGH</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ══════════════════════════════════════════ ARCHITECTURE ══════ -->
+<section>
+  <h2>Architecture &amp; Companion Mode</h2>
+  <div class="arch">
+    <pre>
+  ┌────────────────────────────┐        ┌────────────────────────────┐
+  │   Android (wscan+)         │  HTTP  │   Windows (wscan+)         │
+  │                            │◄──────►│                            │
+  │  ShizukuScanner            │ :9000  │  Npcap / SharpPcap         │
+  │  RootScanner (tcpdump)     │        │  WSL2 monitor-mode bridge  │
+  │  StandardWifiScanner       │  JSON  │  CompanionRelayServer      │
+  │  CompanionClient ──────────┼───────►│  AttackHeuristics          │
+  │  AttackHeuristics          │        │  ThreatDatabase (SQLite)   │
+  │  Room/SQLite               │◄───────┼── /alerts push-back        │
+  │  Firebase Realtime DB      │        │  Firebase Firestore         │
+  │  Gemini AI Analysis        │        │  Gemini AI Analysis        │
+  └────────────────────────────┘        └────────────────────────────┘
+    </pre>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════ REQUIREMENTS ══════ -->
+<section>
+  <h2>Requirements</h2>
+  <div class="card-grid">
+    <div class="card">
+      <h3>🤖 Android</h3>
+      <ul style="padding-left:18px;margin-top:6px;">
+        <li>Android 10 (API 29)+</li>
+        <li><a href="https://github.com/RikkaApps/Shizuku">Shizuku</a> (recommended)</li>
+        <li>Root + tcpdump (optional)</li>
+        <li>Internet for Firebase / Gemini</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>🪟 Windows</h3>
+      <ul style="padding-left:18px;margin-top:6px;">
+        <li>Windows 11 / 10 (21H2+)</li>
+        <li>.NET 8 Desktop Runtime</li>
+        <li><a href="https://npcap.com/">Npcap 1.80+</a></li>
+        <li>WSL2 (optional, for monitor mode)</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════ RELEASES ══════ -->
+<section>
+  <h2>Latest Release — v1.0.0</h2>
+  <div class="release-block">
+    <p><strong>Release date:</strong> 2025-03-04 &nbsp;|&nbsp; <code>v1.0.0</code></p>
+    <p style="margin-top:8px;">Initial public release. Full feature set for both Android and Windows including AI integration readiness, companion mode, and CI/CD workflows.</p>
+    <p style="margin-top:8px;">
+      <a href="https://github.com/dvntone/wscanPLUS/releases/tag/v1.0.0">View release on GitHub →</a>
+    </p>
+  </div>
+  <p><a href="https://github.com/dvntone/wscanPLUS/blob/main/CHANGELOG.md">Full changelog →</a></p>
+</section>
+
+<!-- ══════════════════════════════════════════ FOOTER ══════ -->
+<footer>
+  <p>wscan+ is released under the <a href="https://github.com/dvntone/wscanPLUS/blob/main/LICENSE">CC0 1.0 Universal</a> licence — public domain.</p>
+  <p style="margin-top:6px;"><a href="https://github.com/dvntone/wscanPLUS">github.com/dvntone/wscanPLUS</a></p>
+</footer>
+
+</body>
+</html>

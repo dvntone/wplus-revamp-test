@@ -1,0 +1,81 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main, "copilot/**"]
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "windows/**"
+
+jobs:
+  test:
+    name: Build & Test (Windows)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore NuGet packages
+        working-directory: windows
+        run: dotnet restore WscanPlus.sln
+
+      - name: Build solution (Debug)
+        working-directory: windows
+        run: dotnet build WscanPlus.sln -c Debug --no-restore
+
+      - name: Run unit tests
+        working-directory: windows
+        run: dotnet test WscanPlus.Tests/WscanPlus.Tests.csproj --no-build -c Debug --logger "trx;LogFileName=test-results.trx"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-results
+          path: windows/**/*.trx
+          retention-days: 14
+
+  release-build:
+    name: Publish release build (Windows x64)
+    runs-on: windows-2022
+    if: github.ref == 'refs/heads/main'
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore NuGet packages
+        working-directory: windows
+        run: dotnet restore WscanPlus.sln
+
+      - name: Publish self-contained release
+        working-directory: windows/WscanPlus
+        run: |
+          dotnet publish WscanPlus.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            -o ../../dist/windows
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wscanplus-windows-x64
+          path: dist/windows/
+          retention-days: 30

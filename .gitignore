@@ -1,0 +1,27 @@
+# Android
+android/.gradle/
+android/local.properties
+android/build/
+android/app/build/
+android/.idea/
+android/*.iml
+android/**/*.iml
+android/keystore.properties
+android/*.jks
+android/*.keystore
+
+# Windows / .NET
+windows/**/*.user
+windows/**/*.suo
+windows/**/.vs/
+windows/**/bin/
+windows/**/obj/
+windows/**/*.nupkg
+windows/**/packages/
+
+# General
+*.DS_Store
+Thumbs.db
+*.log
+*.tmp
+.env
