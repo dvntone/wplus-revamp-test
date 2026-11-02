@@ -42,6 +42,7 @@ Configure at **Settings → Secrets and variables → Actions → Variables**.
 | Variable | Required? | Value | Purpose |
 |---|---|---|---|
 | `SONAR_ORGANIZATION` | **Required** for SonarCloud | Your SonarCloud org slug (e.g. `dvntone`) | Identifies your org in SonarCloud project keys |
+| `SONAR_PROJECT_KEY` | Optional | SonarCloud project key (e.g. `dvntone_wscanPLUS`) | Defaults to `<owner>_<repo>` (SonarCloud's auto-import format, here `dvntone_wplus-revamp-test`). Set it if the project was imported under another key |
 
 ---
 
@@ -120,7 +121,7 @@ needing to ask you first:
 
 | Workflow file | Trigger | Needs secrets | Purpose |
 |---|---|---|---|
-| `android.yml` | push/PR to `android/` | None | Build + unit test debug APK |
+| `android.yml` | push/PR touching `app/`, `gradle/` or build files | None | Build + unit test debug APK |
 | `windows.yml` | push/PR to `windows/` | None | Build + unit test .NET solution |
 | `android-release.yml` | version tags / manual | `KEYSTORE_*` (optional) | Full release pipeline: sign APK, create GitHub Release |
 | `code-quality.yml` | every push/PR | None | ktlint, Android Lint, .NET WarningLevel 5, publish check |

@@ -109,13 +109,21 @@ jobs:
 
       - name: Write keystore.properties
         if: env.HAS_KEYSTORE == 'true'
+        env:
+          KS_STORE_PASSWORD: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          KS_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KS_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+        # Secrets come in via env and are written with printf so characters
+        # like $ or ` in a password are not expanded by the shell, and
+        # backslashes are doubled because java.util.Properties.load() treats
+        # them as escapes ("ab\cd" would otherwise load as "abcd").
         run: |
-          cat > keystore.properties <<EOF
-          storeFile=wscanplus-release.jks
-          storePassword=${{ secrets.KEYSTORE_STORE_PASSWORD }}
-          keyAlias=${{ secrets.KEYSTORE_KEY_ALIAS }}
-          keyPassword=${{ secrets.KEYSTORE_KEY_PASSWORD }}
-          EOF
+          {
+            echo "storeFile=wscanplus-release.jks"
+            printf 'storePassword=%s\n' "${KS_STORE_PASSWORD//\\/\\\\}"
+            printf 'keyAlias=%s\n' "${KS_KEY_ALIAS//\\/\\\\}"
+            printf 'keyPassword=%s\n' "${KS_KEY_PASSWORD//\\/\\\\}"
+          } > keystore.properties
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew

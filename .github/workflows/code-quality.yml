@@ -13,23 +13,23 @@ on:
       android_checks:
         description: "Run Android checks"
         required: false
-        default: "true"
-        type: boolean
-      windows_checks:
-        description: "Run Windows checks"
-        required: false
-        default: "true"
-        type: boolean
-      post_pr_comment:
-        description: "Post summary comment on PR"
-        required: false
-        default: "true"
+        default: true
         type: boolean
 
 # Cancel superseded runs on the same branch to save runner minutes.
 concurrency:
   group: code-quality-${{ github.ref }}
   cancel-in-progress: true
+
+# `shell: bash` makes Actions run steps with `-eo pipefail`. Without it the
+# default shell is `bash -e` (no pipefail), so `./gradlew … | tee x.log`
+# always reports the exit status of `tee` and every check looks green.
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
 
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 
@@ -41,9 +41,10 @@ jobs:
   android-quality:
     name: Android Quality Gate
     runs-on: ubuntu-latest
+    # inputs.* is typed: compare booleans to `true`, not the string 'true'.
     if: >
       github.event_name != 'workflow_dispatch' ||
-      inputs.android_checks == 'true'
+      inputs.android_checks == true
 
     steps:
       # ── Setup ──────────────────────────────────────────────────────────────
@@ -168,243 +169,88 @@ jobs:
           summary+="| Unit Tests | $([ "$tests" = "success" ] && echo "✅" || echo "❌") |\n"
           summary+="| Debug APK build | $([ "$build" = "success" ] && echo "✅" || echo "❌") |\n"
 
-          echo "summary<<EOF" >> $GITHUB_OUTPUT
-          printf "%s" "$summary" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          # %b expands the \n escapes; the old "%s" into an unused output
+          # wrote literal backslash-n and was never displayed anywhere.
+          printf "%b" "$summary" >> "$GITHUB_STEP_SUMMARY"
 
-          # Fail the job if compile or apk build failed
+          # Fail the job if compile, tests or apk build failed
           if [ "$compile" != "success" ] || [ "$build" != "success" ] || [ "$tests" != "success" ]; then
             echo "Critical Android check failed"
             exit 1
           fi
 
   # ════════════════════════════════════════════════════════════════════════════
-  # 2. WINDOWS – Roslyn build analysis, xUnit tests, coverage, publish check
-  # ════════════════════════════════════════════════════════════════════════════
-  windows-quality:
-    name: Windows Quality Gate
-    runs-on: windows-latest
-    if: >
-      github.event_name != 'workflow_dispatch' ||
-      inputs.windows_checks == 'true'
-
-    steps:
-      # ── Setup ──────────────────────────────────────────────────────────────
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.0.x"
-
-      # ── Step 1: Restore packages ───────────────────────────────────────────
-      - name: Restore NuGet packages
-        id: restore
-        working-directory: windows
-        run: dotnet restore WscanPlus.sln
-        continue-on-error: true
-
-      # ── Step 2: Build with Roslyn warnings-as-errors (strict compile check) ─
-      - name: Build – strict warnings
-        id: build_strict
-        working-directory: windows
-        run: |
-          dotnet build WscanPlus.sln -c Debug --no-restore `
-            /p:TreatWarningsAsErrors=false `
-            /p:WarningLevel=5 `
-            /flp:logfile=build-warnings.log;verbosity=normal
-        continue-on-error: true
-
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-build-log
-          path: windows/build-warnings.log
-          retention-days: 7
-
-      # ── Step 3: xUnit tests with coverage ─────────────────────────────────
-      - name: Install coverlet global tool
-        run: dotnet tool install --global coverlet.console
-        continue-on-error: true
-
-      - name: Run tests with coverage
-        id: tests
-        working-directory: windows
-        run: |
-          dotnet test WscanPlus.Tests/WscanPlus.Tests.csproj `
-            -c Debug --no-build `
-            --logger "trx;LogFileName=test-results.trx" `
-            --logger "console;verbosity=detailed" `
-            --collect:"XPlat Code Coverage" `
-            --results-directory TestResults/ `
-            2>&1 | Tee-Object -FilePath test.log
-        continue-on-error: true
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-test-results
-          path: |
-            windows/TestResults/
-            windows/**/*.trx
-          retention-days: 14
-
-      # ── Step 4: Publish check (verifies whole app compiles to runnable binary) ─
-      - name: Publish self-contained (release check)
-        id: publish
-        working-directory: windows/WscanPlus
-        run: |
-          dotnet publish WscanPlus.csproj `
-            -c Release `
-            -r win-x64 `
-            --self-contained false `
-            -o ../../dist/windows-quality-check `
-            --no-restore `
-            2>&1 | Tee-Object -FilePath publish.log
-        continue-on-error: true
-
-      - name: Upload publish log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-publish-log
-          path: windows/WscanPlus/publish.log
-          retention-days: 7
-
-      # ── Step 5: Verify critical files are present in published output ──────
-      - name: Verify published output
-        id: verify
-        if: steps.publish.outcome == 'success'
-        run: |
-          $missing = @()
-          $required = @("WscanPlus.exe", "WscanPlus.dll")
-          foreach ($f in $required) {
-            if (-not (Test-Path "dist/windows-quality-check/$f")) {
-              $missing += $f
-            }
-          }
-          if ($missing.Count -gt 0) {
-            Write-Error "Missing published files: $($missing -join ', ')"
-            exit 1
-          }
-          Write-Host "All required published files present."
-        continue-on-error: true
-
-      # ── Collect outcomes ───────────────────────────────────────────────────
-      - name: Generate Windows quality summary
-        if: always()
-        id: windows_summary
-        shell: pwsh
-        run: |
-          $restore = "${{ steps.restore.outcome }}"
-          $build   = "${{ steps.build_strict.outcome }}"
-          $tests   = "${{ steps.tests.outcome }}"
-          $publish = "${{ steps.publish.outcome }}"
-          $verify  = "${{ steps.verify.outcome }}"
-
-          $r = @{ success = "✅"; failure = "❌"; skipped = "⏭"; cancelled = "🚫" }
-
-          $summary  = "## Windows Quality Gate`n"
-          $summary += "| Check | Result |`n|---|---|`n"
-          $summary += "| NuGet restore | $($r[$restore]) |`n"
-          $summary += "| Build (WarningLevel 5) | $($r[$build]) |`n"
-          $summary += "| xUnit Tests | $($r[$tests]) |`n"
-          $summary += "| Publish check | $($r[$publish]) |`n"
-          $summary += "| Published output verify | $($r[$verify]) |`n"
-
-          "summary<<EOF" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
-          $summary | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
-          "EOF" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append -Encoding utf8
-
-          if ($build -ne "success" -or $tests -ne "success" -or $publish -ne "success") {
-            Write-Error "Critical Windows check failed"
-            exit 1
-          }
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # 3. COMBINED SUMMARY – post a rich PR comment summarising all findings
+  # 2. SUMMARY – post / update a PR comment with the gate result
+  #    (The Windows gate was removed: this repo has no windows/ tree since the
+  #    root-level refactor, so that job failed on every run.)
   # ════════════════════════════════════════════════════════════════════════════
   post-summary:
     name: Post Quality Summary
     runs-on: ubuntu-latest
+    # Fork PRs get a read-only GITHUB_TOKEN whatever `permissions:` says, so
+    # commenting would 403 and turn this check red; skip them.
     if: >
       always() &&
       github.event_name == 'pull_request' &&
-      (github.event_name != 'workflow_dispatch' || inputs.post_pr_comment == 'true')
-    needs: [android-quality, windows-quality]
+      github.event.pull_request.head.repo.full_name == github.repository
+    needs: [android-quality]
+    permissions:
+      pull-requests: write
 
     steps:
-      - name: Build summary comment
-        id: comment_body
-        run: |
-          android="${{ needs.android-quality.result }}"
-          windows="${{ needs.windows-quality.result }}"
-
-          icon_android=$([ "$android" = "success" ] && echo "✅" || echo "❌")
-          icon_windows=$([ "$windows" = "success" ] && echo "✅" || echo "❌")
-
-          body="## 🛡 wscan+ Code Quality Gate\n\n"
-          body+="| Platform | Result |\n|---|---|\n"
-          body+="| Android (compile + lint + ktlint + tests + APK) | $icon_android |\n"
-          body+="| Windows (.NET build + xUnit + publish) | $icon_windows |\n\n"
-
-          if [ "$android" != "success" ] || [ "$windows" != "success" ]; then
-            body+="### ⚠ Issues found\n"
-            body+="Check the **Actions** tab for detailed logs and uploaded artefacts.\n"
-            body+="Download the relevant log artefact to see exact error lines.\n"
-          else
-            body+="### 🎉 All checks passed\n"
-            body+="The build is healthy and all quality gates are green.\n"
-          fi
-
-          body+="\n---\n"
-          body+="*Triggered by commit \`${{ github.sha }}\` on \`${{ github.ref_name }}\`.*"
-
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          printf "%s" "$body" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
       - name: Post or update PR comment
         uses: actions/github-script@v7
+        env:
+          ANDROID_RESULT: ${{ needs.android-quality.result }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         with:
+          # Values are read from env rather than spliced into the script with
+          # ${{ }} — splicing broke on the backticks in the body and let the
+          # branch name inject JavaScript.
           script: |
             const marker = '## 🛡 wscan+ Code Quality Gate';
-            const body   = `${{ steps.comment_body.outputs.body }}`;
+            const ok = process.env.ANDROID_RESULT === 'success';
+            let body = `${marker}\n\n`;
+            body += '| Platform | Result |\n|---|---|\n';
+            body += `| Android (compile + lint + ktlint + tests + APK) | ${ok ? '✅' : '❌'} |\n\n`;
+            body += ok
+              ? '### 🎉 All checks passed\nThe build is healthy and all quality gates are green.\n'
+              : '### ⚠ Issues found\nCheck the **Actions** tab for detailed logs and uploaded artefacts.\n';
+            // Ref names may contain backticks; strip them so a branch name
+            // can't close the code span and inject Markdown.
+            const ref = (process.env.HEAD_REF || '').replace(/`/g, '');
+            body += `\n---\n*Triggered by commit \`${process.env.HEAD_SHA}\` on \`${ref}\`.*`;
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner:      context.repo.owner,
-              repo:       context.repo.repo,
+            // Paginate: listComments returns 30 per page, so on busy PRs the
+            // marker comment was missed and a duplicate posted each push.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
               issue_number: context.issue.number,
+              per_page: 100,
             });
-
             const existing = comments.find(c =>
               c.user.type === 'Bot' && c.body.includes(marker));
 
             if (existing) {
               await github.rest.issues.updateComment({
-                owner:      context.repo.owner,
-                repo:       context.repo.repo,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
                 comment_id: existing.id,
                 body,
               });
             } else {
               await github.rest.issues.createComment({
-                owner:      context.repo.owner,
-                repo:       context.repo.repo,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
                 issue_number: context.issue.number,
                 body,
               });
             }
 
   # ════════════════════════════════════════════════════════════════════════════
-  # 4. BUILD-CONFIRMATION MARKER – uploaded only when ALL checks pass on main
+  # 3. BUILD-CONFIRMATION MARKER – uploaded only when ALL checks pass on main
   #    This asset is what UpdateChecker looks for before offering an update.
   # ════════════════════════════════════════════════════════════════════════════
   upload-build-confirmed:
@@ -412,9 +258,8 @@ jobs:
     runs-on: ubuntu-latest
     if: >
       github.ref == 'refs/heads/main' &&
-      needs.android-quality.result == 'success' &&
-      needs.windows-quality.result == 'success'
-    needs: [android-quality, windows-quality]
+      needs.android-quality.result == 'success'
+    needs: [android-quality]
 
     steps:
       - name: Create build-confirmed.txt

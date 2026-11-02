@@ -1,6 +1,6 @@
 # wscanPLUS — Known Issues
 
-> Last updated: 2026-03-05
+> Last updated: 2026-11-02
 > Update this file whenever a new issue is found or an existing issue is resolved.
 > NOTE: wscanPLUS is being merged INTO wifisentry. New feature development should target the unified wifisentry repo. This repo is maintained for reference and the detection engine code.
 
@@ -17,18 +17,73 @@
 
 ## Critical — CI / Build
 
-### KI-W001 [OPEN] All Recent CI Runs Show `action_required`
-- **Affected:** `.github/workflows/` — all workflows on `main`
-- **Symptom:** "Needs Attention – Notify on Blocked / Failing Checks" workflow fires repeatedly, concluding `action_required`.
-- **Root cause:** Likely a protected branch rule or required status check that is failing, causing the notification workflow to loop.
-- **Impact:** Unclear if Android and Windows builds are passing. Last confirmed Android build was on branch `copilot/optimize-file-structure-and-troubleshoot`, not main.
-- **Fix needed:** Inspect the blocked checks. Resolve the underlying failing status check on main.
+### KI-W001 [OPEN — needs owner] No workflow has ever started on `main` (`startup_failure`)
+- **Affected:** every push / dispatch on `wplus-revamp-test` (runs #1–#11, 2026-11-02)
+- **Symptom:** Each push produces exactly one run with `conclusion: startup_failure`, no jobs, an empty
+  workflow name, and `workflow_id 404152221` whose path is `BuildFailed` (state `deleted`). The six
+  real workflows (`android.yml`, `code-quality.yml`, …) have **zero** runs.
+- **Ruled out:** YAML syntax — all six files parse, and the embedded `github-script` JS compiles.
+- **Likely cause (repo/account settings, not code):** Actions blocked before job creation. Check, in order:
+  1. Settings → Actions → General → *Actions permissions* — must allow `actions/*` **and** third-party
+     actions used here (`softprops/action-gh-release`, `SonarSource/sonarcloud-github-action`).
+  2. Account Billing → Actions spending limit / payment method (a billing lock gives `startup_failure` with no jobs).
+  3. Any repository ruleset requiring a workflow that no longer exists (the deleted `BuildFailed` entry).
+- **Note:** `BUILD_STATUS.md` reports "HEALTHY & VERIFIED"; that has not been verified by CI on this repo.
 
-### KI-W002 [OPEN] SonarCloud Failing on Feature Branch
-- **Affected:** `copilot/optimize-file-structure-and-troubleshoot` branch
-- **Symptom:** SonarCloud analysis concludes `failure`; Code Quality Gate also failing.
-- **Root cause:** Likely missing `SONAR_TOKEN` secret or misconfigured `sonar-project.properties`.
-- **Fix needed:** Verify `SONAR_TOKEN` secret and `SONAR_ORGANIZATION` variable in repo settings.
+### KI-W002 [FIXED — pending merge] SonarCloud job misconfigured
+- `projectBaseDir: android` (directory removed in the root-level refactor) → now `.`.
+- `./gradlew jacocoTestReport` — task does not exist; aborted Gradle before tests ran (masked by `|| true`).
+- No `sonar-project.properties` and no `sonar.projectKey` → now passed explicitly
+  (`vars.SONAR_PROJECT_KEY`, default `<owner>_<repo>`).
+- Windows Sonar job removed (no `windows/` tree in this repo).
+- Still requires `SONAR_TOKEN` secret + `SONAR_ORGANIZATION` variable (job is skipped without the variable).
+
+### KI-W011 [FIXED — pending merge] Workflow / build defects found in triage
+| Area | Defect | Effect |
+|---|---|---|
+| `code-quality.yml` | `./gradlew … \| tee log` under default `bash -e` (no `pipefail`) | Compile/test/APK failures always reported ✅ — gate could never fail |
+| `code-quality.yml` | Windows job targets non-existent `windows/WscanPlus.sln` | Gate failed on every run; `build-confirmed` marker never uploaded |
+| `code-quality.yml` | PR comment body spliced into a JS template literal; body contains backticks | `post-summary` threw a syntax error on every PR; also a script-injection path via branch name |
+| `code-quality.yml` | `post-summary` had no `pull-requests: write` | Comment creation 403s on repos with read-only default token |
+| `code-quality.yml`, `android-release.yml` | Boolean `inputs.x == 'true'` (string) | Always false → `android_checks` dispatch skipped the job; `create_release` never created a release |
+| `android.yml`, `android-release.yml` (×2) | Signing secrets interpolated into an unquoted heredoc | Passwords containing `$` or `` ` `` silently corrupted |
+| `android-release.yml` | `apksigner` hardcoded to `build-tools/35.0.0`, errors swallowed | Verification silently skipped when that version is absent |
+| `notify-waiting.yml` | Reads `SONAR_TOKEN_PRESENT` that is never set; flags signing secrets unconditionally | Every Code Quality / Android failure blamed on missing secrets |
+| `notify-waiting.yml` | `inputs.run_id` spliced into JS | Script injection via dispatch input |
+| `app/build.gradle.kts` | `google-services` plugin applied with no `google-services.json` in repo | `processDebugGoogleServices` fails → no build can succeed. Plugin now applied only when the file exists |
+| `gradlew` | Committed without the executable bit | `./gradlew` fails locally/out of CI (CI worked around with `chmod`) |
+| `scripts/validate.{sh,ps1}` | `cd android/` | Local validator broken since root-level refactor |
+
+### KI-W012 [OPEN] Remaining CI follow-ups (not changed)
+- `windows.yml` is dormant (path filter `windows/**` never matches). Delete it, or restore the Windows tree.
+- `android.yml` and `code-quality.yml` both run `test` + `assembleDebug` on every push — duplicate runner minutes.
+- `android-release.yml` auto-bump counts **draft** releases as "previous"; publishing a draft created by
+  `workflow_dispatch` makes a new tag push, which re-runs the pipeline and can create a second draft.
+- `ktlint` binary is downloaded without checksum verification.
+- `notify-waiting.yml` opens a `ci-attention` issue for every failure with no PR — noisy on `main`.
+- `SonarSource/sonarcloud-github-action` is deprecated upstream; migrate to `SonarSource/sonarqube-scan-action`.
+- AGP 8.5.2 + `compileSdk 35` relies on `android.suppressUnsupportedCompileSdk`; upgrade AGP to ≥ 8.7.
+- Doc drift: `KI-W005`–`KI-W010` and `README` still reference `android/…` paths.
+- versionCode formula: PATCH ≥ 100 collides with the next minor (`1.0.100` and `1.1.0` both → `10100900`),
+  and a malformed `version_name` on dispatch (e.g. `foo`) is accepted with versionCode `200`. Validate input.
+- Release builds without a `google-services.json` now succeed (Firebase config absent). Harmless today —
+  `FirebaseSyncService` is never instantiated — but wire a `GOOGLE_SERVICES_JSON` secret before enabling sync.
+
+### KI-W013 [FIXED — pending merge] Code-review follow-ups on the triage commit
+| Finding | Resolution |
+|---|---|
+| Backslashes in signing secrets eaten by `Properties.load()` | `\` doubled before writing; round-trip tested |
+| `google-services.json` per-variant locations ignored | Plugin applied if any `src/**/google-services.json` exists |
+| Fork PRs: `post-summary` 403s | Job skipped when head repo ≠ base repo |
+| Marker comment not found past 30 comments | `github.paginate` (code-quality **and** notify-waiting) |
+| Backticks in branch name inject Markdown | Stripped from ref in comment |
+| `validate.sh/.ps1` abort when `dotnet` present | Windows checks skipped when `windows/` is absent |
+| Default Sonar project key undocumented | `SONAR_PROJECT_KEY` documented in `REQUIRED_SETUP.md` §2 |
+| `apksigner` lookup (env fallback, empty glob, `-rc` dirs) | SDK path fallback, stable versions only, explicit error |
+| Sonar test step results unused | `sonar.junit.reportPaths` passed |
+| Release built without Firebase | Not changed — no runtime path today (see KI-W012) |
+
+Offline tests for the workflow logic: `./scripts/workflow-tests/run.sh`.
 
 ---
 

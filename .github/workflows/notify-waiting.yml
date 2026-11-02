@@ -59,6 +59,14 @@ jobs:
     steps:
       - name: Analyse run and post notification
         uses: actions/github-script@v7
+        env:
+          # Presence flags only ('true'/'false'); the secret values never
+          # reach the script. Previously SONAR_TOKEN_PRESENT was read but never
+          # set, so every Code Quality failure was blamed on a missing token.
+          SONAR_TOKEN_PRESENT: ${{ secrets.SONAR_TOKEN != '' }}
+          SONAR_ORG_PRESENT: ${{ vars.SONAR_ORGANIZATION != '' }}
+          KEYSTORE_PRESENT: ${{ secrets.KEYSTORE_BASE64 != '' }}
+          MANUAL_RUN_ID: ${{ inputs.run_id }}
         with:
           # Give the token pull-requests:write scope
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -66,7 +74,7 @@ jobs:
             // ────────────────────────────────────────────────────────────────
             // 1. Determine which run to inspect
             // ────────────────────────────────────────────────────────────────
-            const manualRunId = '${{ inputs.run_id }}';
+            const manualRunId = (process.env.MANUAL_RUN_ID || '').trim();
             const runId = manualRunId
               ? parseInt(manualRunId)
               : context.payload.workflow_run?.id;
@@ -115,14 +123,16 @@ jobs:
             const missingSecrets = [];
             const missingVars    = [];
 
-            if (workflowName.includes('SonarCloud') ||
-                workflowName.includes('Code Quality')) {
-              if (!process.env.SONAR_TOKEN_PRESENT) {
+            // Only SonarCloud needs Sonar config; Code Quality Gate does not.
+            if (workflowName.includes('SonarCloud')) {
+              if (process.env.SONAR_TOKEN_PRESENT !== 'true') {
                 missingSecrets.push({
                   secret: 'SONAR_TOKEN',
                   where:  'https://sonarcloud.io → My Account → Security → Generate Token',
                   why:    'Required for SonarCloud static-analysis and security scans.',
                 });
+              }
+              if (process.env.SONAR_ORG_PRESENT !== 'true') {
                 missingVars.push({
                   variable: 'SONAR_ORGANIZATION',
                   value:    'Your SonarCloud organization slug (e.g. `dvntone`)',
@@ -131,8 +141,9 @@ jobs:
               }
             }
 
-            if (workflowName.includes('Android Release') ||
-                workflowName.includes('Android CI')) {
+            if (process.env.KEYSTORE_PRESENT !== 'true' &&
+                (workflowName.includes('Android Release') ||
+                 workflowName.includes('Android CI'))) {
               // APK signing secrets — missing these is not fatal (unsigned APK
               // is produced instead) but we flag them so the owner knows.
               missingSecrets.push({
@@ -240,7 +251,7 @@ jobs:
               for (const s of optionalSecrets) {
                 body += `| \`${s.secret}\` | ${s.why} |\n`;
               }
-              body += `\nSee \`android/keystore.properties.template\` for the full setup guide.\n`;
+              body += `\nSee \`REQUIRED_SETUP.md\` §1.1 for the full setup guide.\n`;
               body += `</details>\n\n`;
             }
 
@@ -253,8 +264,8 @@ jobs:
             // ────────────────────────────────────────────────────────────────
             if (prNumber) {
               // Check for an existing notification comment from this workflow
-              const { data: comments } = await github.rest.issues.listComments({
-                owner, repo, issue_number: prNumber,
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: prNumber, per_page: 100,
               });
               const existing = comments.find(c =>
                 c.user.type === 'Bot' && c.body.includes(marker)
