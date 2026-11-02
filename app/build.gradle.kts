@@ -5,7 +5,16 @@ plugins {
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
-    alias(libs.plugins.google.services)
+    // Applied conditionally below: the plugin fails the build when
+    // app/google-services.json is absent, and that file is user-supplied
+    // (not committed). Firebase sync is optional — see KNOWN_ISSUES KI-W008.
+    alias(libs.plugins.google.services) apply false
+}
+
+if (file("google-services.json").exists()) {
+    apply(plugin = "com.google.gms.google-services")
+} else {
+    logger.lifecycle("google-services.json not found – building without Firebase config (sync disabled)")
 }
 
 android {
@@ -32,7 +41,7 @@ android {
                 "proguard-rules.pro"
             )
             // Release signing: configure via keystore.properties (not committed to VCS).
-            // See android/keystore.properties.template for the required format.
+            // See REQUIRED_SETUP.md §1.1 for the required format.
             val keystoreFile = rootProject.file("keystore.properties")
             if (keystoreFile.exists()) {
                 val keystoreProps = Properties().apply {

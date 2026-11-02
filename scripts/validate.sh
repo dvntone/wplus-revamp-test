@@ -48,7 +48,7 @@ done
 # ══════════════════════════════════════════════════════════════════════════════
 if $RUN_ANDROID; then
   header "Android Checks"
-  ANDROID="$ROOT/android"
+  ANDROID="$ROOT"
 
   # ── Prerequisite: Java ───────────────────────────────────────────────────
   if ! command -v java &>/dev/null; then

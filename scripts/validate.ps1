@@ -22,7 +22,7 @@ param(
 
 $ErrorActionPreference = "Continue"
 $Root        = Split-Path $PSScriptRoot -Parent
-$AndroidDir  = Join-Path $Root "android"
+$AndroidDir  = $Root
 $WindowsDir  = Join-Path $Root "windows"
 
 $RunAndroid  = -not $Windows -or $Android

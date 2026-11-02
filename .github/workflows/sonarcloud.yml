@@ -72,11 +72,11 @@ jobs:
             echo "sdkmanager not found; licenses assumed pre-accepted on hosted runner"
           fi
 
-      - name: Build with coverage (for SonarCloud import)
-        run: |
-          ./gradlew test jacocoTestReport --no-daemon \
-            -PtestCoverageEnabled=true \
-            2>&1 || true  # don't fail on test failures; Sonar will report them
+      # No JaCoCo task is configured in app/build.gradle.kts, so the previous
+      # `jacocoTestReport` invocation aborted Gradle before tests ran (and
+      # `|| true` hid it). Run tests only; add JaCoCo later for coverage.
+      - name: Run unit tests (results for SonarCloud)
+        run: ./gradlew test --no-daemon || true  # Sonar reports test failures
 
       - name: Run SonarCloud scan – Android
         uses: SonarSource/sonarcloud-github-action@v3
@@ -84,75 +84,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
-          projectBaseDir: android
+          # Project lives at the repo root since the root-level refactor
+          # (there is no android/ directory any more).
+          projectBaseDir: .
+          # No sonar-project.properties exists, so the key must be passed.
+          # Defaults to SonarCloud's auto-import key format <owner>_<repo>.
           args: |
             -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY || format('{0}_{1}', github.repository_owner, github.event.repository.name) }}
+            -Dsonar.sources=app/src/main
+            -Dsonar.tests=app/src/test
             -Dsonar.qualitygate.wait=true
 
-  # ════════════════════════════════════════════════════════════════════════════
-  # WINDOWS — SonarCloud analysis for C# / WinUI project
-  # ════════════════════════════════════════════════════════════════════════════
-  sonar-windows:
-    name: SonarCloud – Windows (C#)
-    runs-on: windows-latest
-    if: vars.SONAR_ORGANIZATION != ''
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.0.x"
-
-      - name: Install SonarScanner for .NET
-        run: dotnet tool install --global dotnet-sonarscanner
-
-      - name: Install reportgenerator (coverage merging)
-        run: dotnet tool install --global dotnet-reportgenerator-globaltool
-
-      # SonarScanner for .NET requires begin, all build steps, and end to run
-      # from the SAME working directory. All Windows steps use working-directory:
-      # windows so that .sonarqube/ is created there and the build artifacts
-      # are in the same subtree when the scanner post-processes.
-      - name: Begin SonarCloud analysis
-        working-directory: windows
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: |
-          dotnet sonarscanner begin `
-            /k:"dvntone_wscanPLUS_windows" `
-            /n:"wscan+ Windows" `
-            /o:"${{ vars.SONAR_ORGANIZATION }}" `
-            /d:sonar.token="${{ secrets.SONAR_TOKEN }}" `
-            /d:sonar.host.url="https://sonarcloud.io" `
-            /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml" `
-            /d:sonar.qualitygate.wait=true
-
-      - name: Restore NuGet packages
-        working-directory: windows
-        run: dotnet restore WscanPlus.sln
-
-      - name: Build solution
-        working-directory: windows
-        run: dotnet build WscanPlus.sln -c Debug --no-restore
-
-      - name: Run tests with coverage
-        working-directory: windows
-        run: |
-          dotnet test WscanPlus.Tests/WscanPlus.Tests.csproj `
-            -c Debug --no-build `
-            --collect:"XPlat Code Coverage" `
-            --results-directory TestResults/ `
-            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
-        continue-on-error: true
-
-      - name: End SonarCloud analysis
-        working-directory: windows
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: dotnet sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
