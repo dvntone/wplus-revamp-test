@@ -11,7 +11,10 @@ plugins {
     alias(libs.plugins.google.services) apply false
 }
 
-if (file("google-services.json").exists()) {
+// The plugin also accepts per-variant files (src/<variant>/google-services.json).
+val hasGoogleServicesJson = file("google-services.json").exists() ||
+    fileTree("src") { include("**/google-services.json") }.files.isNotEmpty()
+if (hasGoogleServicesJson) {
     apply(plugin = "com.google.gms.google-services")
 } else {
     logger.lifecycle("google-services.json not found – building without Firebase config (sync disabled)")

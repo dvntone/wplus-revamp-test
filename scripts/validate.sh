@@ -114,7 +114,9 @@ if $RUN_WINDOWS; then
   header "Windows Checks"
   WINDOWS="$ROOT/windows"
 
-  if ! command -v dotnet &>/dev/null; then
+  if [ ! -d "$WINDOWS" ]; then
+    warn "No windows/ directory in this repo. Skipping Windows checks."
+  elif ! command -v dotnet &>/dev/null; then
     warn "dotnet SDK not found. Skipping Windows checks. Install .NET 8 SDK to enable them."
   else
     cd "$WINDOWS"

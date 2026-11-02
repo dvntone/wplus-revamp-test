@@ -515,13 +515,15 @@ jobs:
           KS_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
           KS_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
         # Secrets come in via env and are written with printf so characters
-        # like $ or ` in a password are not expanded by the shell.
+        # like $ or ` in a password are not expanded by the shell, and
+        # backslashes are doubled because java.util.Properties.load() treats
+        # them as escapes ("ab\cd" would otherwise load as "abcd").
         run: |
           {
             echo "storeFile=wscanplus-release.jks"
-            printf 'storePassword=%s\n' "$KS_STORE_PASSWORD"
-            printf 'keyAlias=%s\n' "$KS_KEY_ALIAS"
-            printf 'keyPassword=%s\n' "$KS_KEY_PASSWORD"
+            printf 'storePassword=%s\n' "${KS_STORE_PASSWORD//\\/\\\\}"
+            printf 'keyAlias=%s\n' "${KS_KEY_ALIAS//\\/\\\\}"
+            printf 'keyPassword=%s\n' "${KS_KEY_PASSWORD//\\/\\\\}"
           } > keystore.properties
 
       - name: Assemble release APK
@@ -544,7 +546,15 @@ jobs:
           # Use the newest installed build-tools rather than a pinned version
           # that may not exist on the runner image. A failed verification of
           # a signed build is a real error, so it is no longer swallowed.
-          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          # Stable build-tools only (skip -rc/-preview dirs), highest version.
+          APKSIGNER=$(ls -d "$SDK_DIR"/build-tools/*/apksigner 2>/dev/null \
+            | grep -Ev '/[^/]*-[^/]*/apksigner$' | sort -V | tail -1 || true)
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::apksigner not found under $SDK_DIR/build-tools"
+            exit 1
+          fi
+          echo "Using $APKSIGNER"
           "$APKSIGNER" verify --verbose "$APK"
 
       - name: Upload APK artifact
@@ -606,13 +616,15 @@ jobs:
           KS_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
           KS_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
         # Secrets come in via env and are written with printf so characters
-        # like $ or ` in a password are not expanded by the shell.
+        # like $ or ` in a password are not expanded by the shell, and
+        # backslashes are doubled because java.util.Properties.load() treats
+        # them as escapes ("ab\cd" would otherwise load as "abcd").
         run: |
           {
             echo "storeFile=wscanplus-release.jks"
-            printf 'storePassword=%s\n' "$KS_STORE_PASSWORD"
-            printf 'keyAlias=%s\n' "$KS_KEY_ALIAS"
-            printf 'keyPassword=%s\n' "$KS_KEY_PASSWORD"
+            printf 'storePassword=%s\n' "${KS_STORE_PASSWORD//\\/\\\\}"
+            printf 'keyAlias=%s\n' "${KS_KEY_ALIAS//\\/\\\\}"
+            printf 'keyPassword=%s\n' "${KS_KEY_PASSWORD//\\/\\\\}"
           } > keystore.properties
 
       - name: Bundle release AAB

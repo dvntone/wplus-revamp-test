@@ -114,13 +114,15 @@ jobs:
           KS_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
           KS_KEY_PASSWORD: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
         # Secrets come in via env and are written with printf so characters
-        # like $ or ` in a password are not expanded by the shell.
+        # like $ or ` in a password are not expanded by the shell, and
+        # backslashes are doubled because java.util.Properties.load() treats
+        # them as escapes ("ab\cd" would otherwise load as "abcd").
         run: |
           {
             echo "storeFile=wscanplus-release.jks"
-            printf 'storePassword=%s\n' "$KS_STORE_PASSWORD"
-            printf 'keyAlias=%s\n' "$KS_KEY_ALIAS"
-            printf 'keyPassword=%s\n' "$KS_KEY_PASSWORD"
+            printf 'storePassword=%s\n' "${KS_STORE_PASSWORD//\\/\\\\}"
+            printf 'keyAlias=%s\n' "${KS_KEY_ALIAS//\\/\\\\}"
+            printf 'keyPassword=%s\n' "${KS_KEY_PASSWORD//\\/\\\\}"
           } > keystore.properties
 
       - name: Grant execute permission for gradlew

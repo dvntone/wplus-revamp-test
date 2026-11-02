@@ -91,7 +91,9 @@ if ($RunAndroid) {
 if ($RunWindows) {
     Write-Header "Windows Checks"
 
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path $WindowsDir)) {
+        Write-Warn "No windows/ directory in this repo. Skipping Windows checks."
+    } elseif (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
         Write-Warn "dotnet SDK not found. Install .NET 8 SDK to enable Windows checks."
     } else {
         Push-Location $WindowsDir

@@ -76,7 +76,9 @@ jobs:
       # `jacocoTestReport` invocation aborted Gradle before tests ran (and
       # `|| true` hid it). Run tests only; add JaCoCo later for coverage.
       - name: Run unit tests (results for SonarCloud)
-        run: ./gradlew test --no-daemon || true  # Sonar reports test failures
+        # Results are imported via sonar.junit.reportPaths below; failures are
+        # not fatal here because the Code Quality Gate already enforces tests.
+        run: ./gradlew testDebugUnitTest --no-daemon || true
 
       - name: Run SonarCloud scan – Android
         uses: SonarSource/sonarcloud-github-action@v3
@@ -94,5 +96,6 @@ jobs:
             -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY || format('{0}_{1}', github.repository_owner, github.event.repository.name) }}
             -Dsonar.sources=app/src/main
             -Dsonar.tests=app/src/test
+            -Dsonar.junit.reportPaths=app/build/test-results/testDebugUnitTest
             -Dsonar.qualitygate.wait=true
 

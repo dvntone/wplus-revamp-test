@@ -63,7 +63,27 @@
 - `notify-waiting.yml` opens a `ci-attention` issue for every failure with no PR — noisy on `main`.
 - `SonarSource/sonarcloud-github-action` is deprecated upstream; migrate to `SonarSource/sonarqube-scan-action`.
 - AGP 8.5.2 + `compileSdk 35` relies on `android.suppressUnsupportedCompileSdk`; upgrade AGP to ≥ 8.7.
-- Doc drift: `KI-W005`–`KI-W010`, `REQUIRED_SETUP.md` and `README` still reference `android/…` paths.
+- Doc drift: `KI-W005`–`KI-W010` and `README` still reference `android/…` paths.
+- versionCode formula: PATCH ≥ 100 collides with the next minor (`1.0.100` and `1.1.0` both → `10100900`),
+  and a malformed `version_name` on dispatch (e.g. `foo`) is accepted with versionCode `200`. Validate input.
+- Release builds without a `google-services.json` now succeed (Firebase config absent). Harmless today —
+  `FirebaseSyncService` is never instantiated — but wire a `GOOGLE_SERVICES_JSON` secret before enabling sync.
+
+### KI-W013 [FIXED — pending merge] Code-review follow-ups on the triage commit
+| Finding | Resolution |
+|---|---|
+| Backslashes in signing secrets eaten by `Properties.load()` | `\` doubled before writing; round-trip tested |
+| `google-services.json` per-variant locations ignored | Plugin applied if any `src/**/google-services.json` exists |
+| Fork PRs: `post-summary` 403s | Job skipped when head repo ≠ base repo |
+| Marker comment not found past 30 comments | `github.paginate` (code-quality **and** notify-waiting) |
+| Backticks in branch name inject Markdown | Stripped from ref in comment |
+| `validate.sh/.ps1` abort when `dotnet` present | Windows checks skipped when `windows/` is absent |
+| Default Sonar project key undocumented | `SONAR_PROJECT_KEY` documented in `REQUIRED_SETUP.md` §2 |
+| `apksigner` lookup (env fallback, empty glob, `-rc` dirs) | SDK path fallback, stable versions only, explicit error |
+| Sonar test step results unused | `sonar.junit.reportPaths` passed |
+| Release built without Firebase | Not changed — no runtime path today (see KI-W012) |
+
+Offline tests for the workflow logic: `./scripts/workflow-tests/run.sh`.
 
 ---
 
