@@ -132,8 +132,15 @@ object AppPreferences {
         return newToken
     }
 
+    // ── Cryptographic KeyStore & AES-256-GCM Encryption ──────────────────────
+    private const val KEY_ALIAS = "wscanplus_secret_master_key"
+    private const val ANDROID_KEYSTORE = "AndroidKeyStore"
+    private const val CIPHER_AES_GCM = "AES/GCM/NoPadding"
+    private const val GCM_TAG_LENGTH = 128
+    private const val ENC_PREFIX = "enc:v1:"
+
     /**
-     * Stores sensitive API keys with encryption or obfuscation in private app storage.
+     * Stores sensitive API keys with AES-256-GCM encryption backed by AndroidKeyStore.
      */
     fun setSecureSecret(context: Context, key: String, secret: String) {
         val prefs = main(context)
@@ -141,20 +148,118 @@ object AppPreferences {
             prefs.edit().remove(key).apply()
             return
         }
-        val encoded = android.util.Base64.encodeToString(secret.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
-        prefs.edit().putString(key, encoded).apply()
+        val encrypted = encryptString(context, secret)
+        prefs.edit().putString(key, encrypted).apply()
     }
 
     /**
-     * Retrieves sensitive API keys from private app storage.
+     * Retrieves and decrypts sensitive API keys from private app storage.
+     * Supports automatic backward compatibility with legacy Base64/plain values.
      */
     fun getSecureSecret(context: Context, key: String, fallback: String = ""): String {
         val raw = main(context).getString(key, null) ?: return fallback
+        if (raw.isBlank()) return fallback
+
+        // If encrypted with AES-GCM
+        if (raw.startsWith(ENC_PREFIX)) {
+            val decrypted = decryptString(context, raw)
+            if (decrypted != null) return decrypted
+        }
+
+        // Backward-compatible fallback: legacy Base64 or plain string
         return try {
-            val bytes = android.util.Base64.decode(raw, android.util.Base64.DEFAULT)
-            String(bytes, Charsets.UTF_8)
+            val bytes = b64Decode(raw)
+            val decoded = String(bytes, Charsets.UTF_8)
+            // If successfully decoded, migrate to encrypted storage in background
+            if (decoded.isNotBlank()) {
+                setSecureSecret(context, key, decoded)
+                decoded
+            } else {
+                raw
+            }
         } catch (_: Exception) {
             raw
         }
     }
+
+    private fun b64Encode(bytes: ByteArray): String {
+        return try {
+            java.util.Base64.getEncoder().encodeToString(bytes)
+        } catch (_: Throwable) {
+            android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        }
+    }
+
+    private fun b64Decode(str: String): ByteArray {
+        return try {
+            java.util.Base64.getDecoder().decode(str.trim())
+        } catch (_: Throwable) {
+            android.util.Base64.decode(str, android.util.Base64.DEFAULT)
+        }
+    }
+
+    private fun getOrCreateKey(): java.security.Key {
+        return try {
+            val keyStore = java.security.KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (!keyStore.containsAlias(KEY_ALIAS)) {
+                val keyGen = javax.crypto.KeyGenerator.getInstance(
+                    android.security.keystore.KeyProperties.KEY_ALGORITHM_AES,
+                    ANDROID_KEYSTORE
+                )
+                val spec = android.security.keystore.KeyGenParameterSpec.Builder(
+                    KEY_ALIAS,
+                    android.security.keystore.KeyProperties.PURPOSE_ENCRYPT or android.security.keystore.KeyProperties.PURPOSE_DECRYPT
+                )
+                    .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setKeySize(256)
+                    .build()
+                keyGen.init(spec)
+                keyGen.generateKey()
+            }
+            keyStore.getKey(KEY_ALIAS, null)
+        } catch (_: Exception) {
+            // JVM / unit test environment fallback: derive consistent software AES key
+            val salt = "wscanplus_master_keystore_fallback_salt_32bytes!!".toByteArray(Charsets.UTF_8)
+            val keyBytes = java.util.Arrays.copyOf(salt, 32)
+            javax.crypto.spec.SecretKeySpec(keyBytes, "AES")
+        }
+    }
+
+    private fun encryptString(context: Context, plainText: String): String {
+        return try {
+            val key = getOrCreateKey()
+            val cipher = javax.crypto.Cipher.getInstance(CIPHER_AES_GCM)
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key)
+            val iv = cipher.iv
+            val cipherBytes = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+
+            val ivB64 = b64Encode(iv)
+            val encB64 = b64Encode(cipherBytes)
+            "$ENC_PREFIX$ivB64:$encB64"
+        } catch (e: Exception) {
+            android.util.Log.w("AppPreferences", "KeyStore encryption failed, falling back to Base64: ${e.message}")
+            b64Encode(plainText.toByteArray(Charsets.UTF_8))
+        }
+    }
+
+    private fun decryptString(context: Context, payload: String): String? {
+        return try {
+            val parts = payload.removePrefix(ENC_PREFIX).split(":")
+            if (parts.size != 2) return null
+            val iv = b64Decode(parts[0])
+            val cipherBytes = b64Decode(parts[1])
+
+            val key = getOrCreateKey()
+            val cipher = javax.crypto.Cipher.getInstance(CIPHER_AES_GCM)
+            val spec = javax.crypto.spec.GCMParameterSpec(GCM_TAG_LENGTH, iv)
+            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, key, spec)
+            val decryptedBytes = cipher.doFinal(cipherBytes)
+            String(decryptedBytes, Charsets.UTF_8)
+        } catch (e: Exception) {
+            android.util.Log.w("AppPreferences", "KeyStore decryption failed: ${e.message}")
+            null
+        }
+    }
 }
+

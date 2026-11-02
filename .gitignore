@@ -1,3 +1,15 @@
+# Gradle & Android Build Outputs
+.gradle/
+build/
+app/build/
+.build-outputs/
+export/
+*.keystore
+*.keystore.base64
+*.jks
+keystore.properties
+local.properties
+
 # Android
 android/.gradle/
 android/local.properties
@@ -9,15 +21,6 @@ android/**/*.iml
 android/keystore.properties
 android/*.jks
 android/*.keystore
-
-# Windows / .NET
-windows/**/*.user
-windows/**/*.suo
-windows/**/.vs/
-windows/**/bin/
-windows/**/obj/
-windows/**/*.nupkg
-windows/**/packages/
 
 # General
 *.DS_Store

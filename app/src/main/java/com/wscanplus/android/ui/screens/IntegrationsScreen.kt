@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.sp
 import com.wscanplus.android.WscanPlusApplication
 import com.wscanplus.android.core.AgentMcpServer
 import com.wscanplus.android.core.IntegrationsManager
+import com.wscanplus.android.core.LinuxEnvironmentService
 import com.wscanplus.android.core.PixelAvfDebianGuest
 import com.wscanplus.android.core.TermuxBridge
 import kotlinx.coroutines.launch
@@ -52,6 +53,10 @@ fun IntegrationsScreen() {
     var termuxStatus by remember { mutableStateOf(TermuxBridge.TermuxStatus()) }
     var avfGuestState by remember { mutableStateOf(PixelAvfDebianGuest.AvfGuestState()) }
 
+    // AVF Debian Probed Binaries State
+    val probedBinaries by LinuxEnvironmentService.installedBinaries.collectAsState()
+    val isProbingBinaries by LinuxEnvironmentService.isProbingBinaries.collectAsState()
+
     // MCP Server State
     var isMcpRunning by remember { mutableStateOf(mcpServer.isServerRunning()) }
     var localIp by remember { mutableStateOf(AgentMcpServer.getLocalIpAddress()) }
@@ -75,6 +80,9 @@ fun IntegrationsScreen() {
         }
         scope.launch {
             avfGuestState = PixelAvfDebianGuest.probeGuestState(context)
+        }
+        scope.launch {
+            LinuxEnvironmentService.probeInstalledBinaries(context)
         }
     }
 
@@ -225,6 +233,223 @@ fun IntegrationsScreen() {
                                         fontFamily = FontFamily.Monospace,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer
                                     )
+                                }
+                            }
+                        }
+
+                        // Probed AVF Guest Security Binaries Card (Kismet, tcpdump, TShark)
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("probed_binaries_card"),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(14.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Security,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                        Column {
+                                            Text(
+                                                "Debian Guest Security Binaries",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            val installedCount = probedBinaries.count { it.isInstalled }
+                                            val totalCount = if (probedBinaries.isNotEmpty()) probedBinaries.size else 3
+                                            Text(
+                                                if (probedBinaries.isEmpty()) "Probe kismet, tcpdump, tshark & tools"
+                                                else "$installedCount of $totalCount installed in guest",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+
+                                    FilledTonalButton(
+                                        onClick = {
+                                            scope.launch {
+                                                LinuxEnvironmentService.probeInstalledBinaries(context)
+                                                snackbarHostState.showSnackbar("Probed AVF guest binaries")
+                                            }
+                                        },
+                                        enabled = !isProbingBinaries,
+                                        modifier = Modifier.testTag("probe_avf_binaries_button")
+                                    ) {
+                                        if (isProbingBinaries) {
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(16.dp),
+                                                strokeWidth = 2.dp,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Probing...")
+                                        } else {
+                                            Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Probe Binaries")
+                                        }
+                                    }
+                                }
+
+                                if (isProbingBinaries) {
+                                    LinearProgressIndicator(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("probing_progress_indicator")
+                                    )
+                                }
+
+                                // List of core probed tools
+                                val displayList = if (probedBinaries.isNotEmpty()) {
+                                    probedBinaries
+                                } else {
+                                    // Default initial representation before probe
+                                    listOf(
+                                        LinuxEnvironmentService.InstalledBinaryInfo(
+                                            binary = "kismet",
+                                            displayName = "Kismet Wireless IDS",
+                                            isInstalled = false,
+                                            version = null,
+                                            category = LinuxEnvironmentService.ToolCategory.WIFI_AUDIT
+                                        ),
+                                        LinuxEnvironmentService.InstalledBinaryInfo(
+                                            binary = "tcpdump",
+                                            displayName = "tcpdump Packet Capture",
+                                            isInstalled = false,
+                                            version = null,
+                                            category = LinuxEnvironmentService.ToolCategory.PACKET_ANALYSIS
+                                        ),
+                                        LinuxEnvironmentService.InstalledBinaryInfo(
+                                            binary = "tshark",
+                                            displayName = "TShark Protocol Dissector",
+                                            isInstalled = false,
+                                            version = null,
+                                            category = LinuxEnvironmentService.ToolCategory.PACKET_ANALYSIS
+                                        )
+                                    )
+                                }
+
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    displayList.forEach { info ->
+                                        Surface(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .testTag("binary_item_${info.binary}"),
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = MaterialTheme.colorScheme.surface,
+                                            tonalElevation = 2.dp
+                                        ) {
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(10.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = when (info.category) {
+                                                        LinuxEnvironmentService.ToolCategory.WIFI_AUDIT -> Icons.Filled.Wifi
+                                                        LinuxEnvironmentService.ToolCategory.PACKET_ANALYSIS -> Icons.Filled.NetworkCheck
+                                                        LinuxEnvironmentService.ToolCategory.SDR_RF -> Icons.Filled.Sensors
+                                                        LinuxEnvironmentService.ToolCategory.NETWORK_DISCOVERY -> Icons.Filled.Radar
+                                                        LinuxEnvironmentService.ToolCategory.IDS_IPS -> Icons.Filled.Shield
+                                                    },
+                                                    contentDescription = null,
+                                                    tint = if (info.isInstalled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+                                                    modifier = Modifier.size(24.dp)
+                                                )
+
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = info.binary,
+                                                            style = MaterialTheme.typography.titleSmall,
+                                                            fontWeight = FontWeight.Bold,
+                                                            fontFamily = FontFamily.Monospace
+                                                        )
+                                                        Text(
+                                                            text = "(${info.displayName})",
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+
+                                                    if (info.isInstalled) {
+                                                        if (!info.version.isNullOrBlank()) {
+                                                            Text(
+                                                                text = "Version: ${info.version}",
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                fontFamily = FontFamily.Monospace,
+                                                                color = Color(0xFF2E7D32)
+                                                            )
+                                                        }
+                                                        if (!info.binaryPath.isNullOrBlank()) {
+                                                            Text(
+                                                                text = "Path: ${info.binaryPath}",
+                                                                style = MaterialTheme.typography.labelSmall,
+                                                                fontFamily = FontFamily.Monospace,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                            )
+                                                        }
+                                                    } else {
+                                                        Text(
+                                                            text = "Not found in AVF guest ($ sudo apt install ${info.binary})",
+                                                            style = MaterialTheme.typography.bodySmall,
+                                                            color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f)
+                                                        )
+                                                    }
+                                                }
+
+                                                // Installed / Missing Status Chip
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = if (info.isInstalled) Color(0xFFE8F5E9) else MaterialTheme.colorScheme.surfaceVariant
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = if (info.isInstalled) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
+                                                            contentDescription = null,
+                                                            tint = if (info.isInstalled) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                            modifier = Modifier.size(14.dp)
+                                                        )
+                                                        Text(
+                                                            text = if (info.isInstalled) "Installed" else "Missing",
+                                                            fontSize = 11.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = if (info.isInstalled) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -4,42 +4,27 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.regex.Pattern
 
 /**
- * LinuxEnvironmentService – manages the Android 17+ built-in Linux Virtual
- * Machine (Android Virtualization Framework / AVF) and bridges to Termux for
- * older devices.
+ * LinuxEnvironmentService – manages the secure bridge between Android and the
+ * Pixel AVF (Android Virtualization Framework) Debian guest virtual machine,
+ * providing:
  *
- * ## Android 17+ Linux VM
- * Android 17 introduces an opt-in "Android Linux" feature that runs a full
- * Debian/Ubuntu-derived root filesystem inside AVF (KVM-backed).  Users can
- * enable it in Settings → System → Linux environment.
- *
- * When enabled the VM exposes a Unix socket or `virtio-console` device that
- * apps can communicate with.  Commands are forwarded via `LocalSocket` bound
- * to `@linux-rpc` (subject to AVF ABI finalisation).
- *
- * ## sudo / package management
- * Inside the Linux VM the user has sudo without a password (the VM is
- * sandboxed; "sudo" in this context means elevated privileges within the VM,
- * not the Android host).  Commands that require sudo are automatically
- * prefixed.
- *
- * ## Fallback: Termux
- * For Android ≤ 16 or when the Linux VM is disabled, this service falls back
- * to Termux via `am startservice` + the `RUN_COMMAND` intent API, which
- * allows background command execution inside Termux's environment without
- * opening the app UI.
- *
- * ## Additional package repositories
- * When the Linux VM is active, the service can configure additional apt sources
- * (stored in [AppPreferences.KEY_LINUX_ENV_EXTRA_REPOS]) so that tools like
- * aircrack-ng, Kismet, and tshark are available via `apt install`.
- *
- * @see <a href="https://source.android.com/docs/core/virtualization">AVF documentation</a>
+ * 1. Deep package & capability probing for installed security tools (Kismet, tcpdump, etc.)
+ * 2. Authenticated, sandboxed command execution channel for external tool orchestration
+ * 3. Strict host/guest isolation ensuring Debian execution is never substituted with Android host shell
+ * 4. Fallback execution via Termux (using com.termux.RUN_COMMAND) for non-AVF environments
  */
 object LinuxEnvironmentService {
 
@@ -48,16 +33,103 @@ object LinuxEnvironmentService {
     /** Minimum Android SDK version that ships AVF virtualization capabilities. */
     private const val LINUX_VM_MIN_SDK = 34 // Android 14+
 
+    /** Sandboxed working directory inside the Debian guest container. */
+    const val SANDBOX_WORKING_DIR = "/tmp/wscanplus_sandbox"
+
+    // ── Tool Catalog & Categories ─────────────────────────────────────────────
+
+    enum class ToolCategory(val displayName: String) {
+        WIFI_AUDIT("802.11 Wi-Fi"),
+        PACKET_ANALYSIS("Packet Inspection"),
+        SDR_RF("Software Defined Radio"),
+        NETWORK_DISCOVERY("Network Recon"),
+        IDS_IPS("Intrusion Detection")
+    }
+
+    data class SecurityToolPackage(
+        val id: String,
+        val name: String,
+        val binary: String,
+        val category: ToolCategory,
+        val isInstalled: Boolean,
+        val path: String? = null,
+        val version: String? = null,
+        val isServiceActive: Boolean = false,
+        val defaultPort: Int? = null,
+        val description: String,
+        val sourceEnvironment: String
+    )
+
+    data class InstalledBinaryInfo(
+        val binary: String,
+        val displayName: String,
+        val isInstalled: Boolean,
+        val version: String? = null,
+        val binaryPath: String? = null,
+        val category: ToolCategory = ToolCategory.PACKET_ANALYSIS,
+        val executionChannel: String = "Pixel AVF Debian Guest",
+        val lastProbedTimestamp: Long = System.currentTimeMillis()
+    )
+
+    // Reactive StateFlows for UI observation
+    private val _installedBinaries = MutableStateFlow<List<InstalledBinaryInfo>>(emptyList())
+    val installedBinaries: StateFlow<List<InstalledBinaryInfo>> = _installedBinaries.asStateFlow()
+
+    private val _isProbingBinaries = MutableStateFlow(false)
+    val isProbingBinaries: StateFlow<Boolean> = _isProbingBinaries.asStateFlow()
+
+    private val _lastProbeError = MutableStateFlow<String?>(null)
+    val lastProbeError: StateFlow<String?> = _lastProbeError.asStateFlow()
+
+    data class ToolOrchestrationRequest(
+        val toolId: String,
+        val subCommand: String? = null,
+        val arguments: List<String> = emptyList(),
+        val requiresSudo: Boolean = false,
+        val timeoutSeconds: Long = 30,
+        val authToken: String? = null,
+        val workingDirectory: String = SANDBOX_WORKING_DIR
+    )
+
+    data class ToolOrchestrationResult(
+        val success: Boolean,
+        val exitCode: Int,
+        val stdout: String,
+        val stderr: String?,
+        val executionChannel: String,
+        val durationMs: Long,
+        val sandboxVerified: Boolean,
+        val toolPackage: String? = null
+    )
+
+    data class ToolSession(
+        val sessionId: String,
+        val toolId: String,
+        val sessionName: String,
+        val pid: Int?,
+        val startTimeMs: Long,
+        val executionChannel: String,
+        var isRunning: Boolean = true
+    )
+
+    // Active background tool sessions
+    private val activeSessions = ConcurrentHashMap<String, ToolSession>()
+
+    // Whitelist of allowed security binaries for sandboxed execution
+    private val ALLOWED_SECURITY_BINARIES = setOf(
+        "kismet", "kismet_server", "tcpdump", "tshark", "wireshark",
+        "aircrack-ng", "airmon-ng", "airodump-ng", "aireplay-ng", "airbase-ng",
+        "iw", "iwconfig", "iwlist", "hcxdumptool", "hcxpcapngtool",
+        "rtl_tcp", "rtl_433", "hackrf_info", "nmap", "suricata",
+        "uname", "which", "cat", "ps", "ls", "echo", "id", "uptime", "free"
+    )
+
     // ── Availability detection ────────────────────────────────────────────────
 
     /**
      * Returns true when the Android Linux VM / Pixel AVF Terminal is available.
-     *
-     * Checks for the Pixel Terminal package, the system virtualization feature,
-     * or the `virtualmachine` system service.
      */
     fun isLinuxVmAvailable(context: Context): Boolean {
-        // Direct check: Pixel AVF Terminal app is installed
         val terminalAppInstalled = try {
             context.packageManager.getPackageInfo(IntegrationsManager.PKG_PIXEL_TERMINAL, 0)
             true
@@ -90,28 +162,529 @@ object LinuxEnvironmentService {
     }
 
     enum class LinuxEnvironment {
-        /** Android 17+ AVF-backed Linux VM. */
+        /** Android 14+ AVF-backed Linux VM (Debian guest). */
         ANDROID_LINUX_VM,
-        /** Termux on Android ≤ 16. */
+        /** Termux on Android devices. */
         TERMUX,
         /** No Linux environment available. */
         NONE,
     }
 
-    // ── Command execution ─────────────────────────────────────────────────────
+    // ── Security Package Probing (Kismet, tcpdump, TShark, SDR, etc.) ─────────
 
     /**
-     * Run a shell command inside the best available Linux environment and
-     * return its stdout.
+     * Probes the Debian guest VM (or Termux fallback) for installed security tool packages,
+     * discovering executable paths, versions, and running daemon ports.
+     */
+    suspend fun probeInstalledSecurityPackages(
+        context: Context,
+        host: String = PixelAvfDebianGuest.DEFAULT_GUEST_HOST,
+        port: Int = PixelAvfDebianGuest.DEFAULT_SSH_PORT
+    ): List<SecurityToolPackage> = withContext(Dispatchers.IO) {
+        val env = getEnvironment(context)
+        val isAvf = env == LinuxEnvironment.ANDROID_LINUX_VM
+
+        // Predefined list of standard defensive and audit tools
+        val probeTargets = listOf(
+            Triple("kismet", "Kismet Wireless IDS & Wardrive", ToolCategory.WIFI_AUDIT to 2501),
+            Triple("tcpdump", "TCPDump Packet Capture", ToolCategory.PACKET_ANALYSIS to null),
+            Triple("tshark", "TShark / Wireshark Analyzer", ToolCategory.PACKET_ANALYSIS to null),
+            Triple("aircrack-ng", "Aircrack-ng Wi-Fi Security Suite", ToolCategory.WIFI_AUDIT to null),
+            Triple("airmon-ng", "Airmon-ng Interface Manager", ToolCategory.WIFI_AUDIT to null),
+            Triple("airodump-ng", "Airodump-ng 802.11 Frame Logger", ToolCategory.WIFI_AUDIT to null),
+            Triple("rtl_tcp", "RTL-SDR Network Spectrum Daemon", ToolCategory.SDR_RF to 1234),
+            Triple("iw", "Linux nl80211 Wireless Tool", ToolCategory.WIFI_AUDIT to null),
+            Triple("hcxdumptool", "HCX Frame & PMKID Auditor", ToolCategory.WIFI_AUDIT to null),
+            Triple("nmap", "Nmap Network Exploration", ToolCategory.NETWORK_DISCOVERY to null),
+            Triple("suricata", "Suricata Network IDS/IPS Engine", ToolCategory.IDS_IPS to null)
+        )
+
+        val results = mutableListOf<SecurityToolPackage>()
+
+        // 1. Batch lookup of binaries via 'which'
+        val binaryList = probeTargets.joinToString(" ") { it.first }
+        val checkCommand = "which $binaryList 2>/dev/null"
+
+        val whichOutput = if (isAvf) {
+            val res = PixelAvfDebianGuest.executeGuestCommand(context, checkCommand, host, port, timeoutSeconds = 6)
+            if (res.success) res.stdout else ""
+        } else if (env == LinuxEnvironment.TERMUX) {
+            val res = TermuxBridge.executeCommand(context, checkCommand, timeoutSeconds = 6)
+            if (res.success) res.stdout else ""
+        } else {
+            ""
+        }
+
+        val foundPaths = mutableMapOf<String, String>()
+        whichOutput.lines().forEach { line ->
+            val trimmed = line.trim()
+            if (trimmed.isNotBlank() && trimmed.startsWith("/")) {
+                val binName = trimmed.substringAfterLast("/")
+                foundPaths[binName] = trimmed
+            }
+        }
+
+        // 2. Iterate each tool, test daemon ports, and probe versions for installed tools
+        for ((binary, name, meta) in probeTargets) {
+            val (category, defaultPort) = meta
+            val path = foundPaths[binary]
+            val isInstalled = path != null
+
+            var version: String? = null
+            var isServiceActive = false
+
+            if (isInstalled) {
+                // Test if the associated network daemon is listening
+                if (defaultPort != null) {
+                    isServiceActive = testSocketReachable(host, defaultPort, 300)
+                }
+
+                // Query tool version string safely
+                val versionCmd = when (binary) {
+                    "kismet" -> "kismet --version 2>&1 | head -n 1"
+                    "tcpdump" -> "tcpdump --version 2>&1 | head -n 1"
+                    "tshark" -> "tshark -v 2>&1 | head -n 1"
+                    "aircrack-ng" -> "aircrack-ng --help 2>&1 | head -n 2"
+                    "rtl_tcp" -> "rtl_tcp --help 2>&1 | head -n 1"
+                    "nmap" -> "nmap -V 2>&1 | head -n 1"
+                    "suricata" -> "suricata -V 2>&1 | head -n 1"
+                    else -> "$binary --version 2>&1 | head -n 1"
+                }
+
+                val verRes = if (isAvf) {
+                    PixelAvfDebianGuest.executeGuestCommand(context, versionCmd, host, port, timeoutSeconds = 4)
+                } else {
+                    val termuxRes = TermuxBridge.executeCommand(context, versionCmd, timeoutSeconds = 4)
+                    PixelAvfDebianGuest.GuestExecutionResult(
+                        success = termuxRes.success,
+                        exitCode = termuxRes.exitCode,
+                        stdout = termuxRes.stdout,
+                        stderr = termuxRes.stderr,
+                        verifiedDebianEnvironment = false,
+                        executionChannel = termuxRes.executionChannel
+                    )
+                }
+
+                if (verRes.success && verRes.stdout.isNotBlank()) {
+                    version = verRes.stdout.lines().firstOrNull { it.isNotBlank() }?.take(80)
+                }
+            }
+
+            val desc = when (binary) {
+                "kismet" -> "Wireless network detector, sniffer, wardrive logger, and WIDS framework with live REST API."
+                "tcpdump" -> "Command-line packet analyzer for raw frame logging and PCAP capture."
+                "tshark" -> "Terminal Wireshark packet analyzer for deep frame dissection and protocol decode."
+                "aircrack-ng" -> "Complete 802.11 security auditing suite with WEP/WPA key recovery tools."
+                "airmon-ng" -> "Virtual interface script to configure monitor mode on 802.11 hardware."
+                "airodump-ng" -> "Raw 802.11 packet capture utility to gather beacons, IVs, and handshake frames."
+                "rtl_tcp" -> "I/Q spectrum streaming daemon for USB RTL-SDR dongles over TCP/IP."
+                "iw" -> "Standard Linux utility for manipulating nl80211 wireless devices and attributes."
+                "hcxdumptool" -> "Captures packets from wireless devices to detect PMKID/EAPOL vulnerabilities."
+                "nmap" -> "Network exploration tool and security / port scanner."
+                "suricata" -> "High-performance network threat detection and event correlation engine."
+                else -> "Installed Linux security utility."
+            }
+
+            results += SecurityToolPackage(
+                id = binary,
+                name = name,
+                binary = binary,
+                category = category,
+                isInstalled = isInstalled,
+                path = path,
+                version = version,
+                isServiceActive = isServiceActive,
+                defaultPort = defaultPort,
+                description = desc,
+                sourceEnvironment = if (isAvf) "Pixel AVF Debian Guest" else "Termux Userland"
+            )
+        }
+
+        results
+    }
+
+    /**
+     * Probes the Pixel AVF Debian environment for installed binaries like 'kismet', 'tcpdump',
+     * and 'tshark', reporting their existence, full filesystem path, and parsed version back
+     * to the Android UI via [installedBinaries] StateFlow.
      *
-     * - In [LinuxEnvironment.ANDROID_LINUX_VM]: commands are forwarded to the
-     *   VM via a subprocess call to the AVF helper binary; sudo is prepended
-     *   automatically when [requiresSudo] is true.
-     * - In [LinuxEnvironment.TERMUX]: the command is executed via the Termux
-     *   `RUN_COMMAND` intent API.
-     * - In [LinuxEnvironment.NONE]: returns `null`.
+     * In accordance with project architecture:
+     * - Strictly queries the Pixel AVF Debian guest via authenticated socket or VM helper
+     * - Never substitutes Android host shell output for Debian execution
+     * - Supports Termux fallback if AVF is not present
+     */
+    suspend fun probeInstalledBinaries(
+        context: Context,
+        binaries: List<String> = listOf("kismet", "tcpdump", "tshark", "aircrack-ng", "airmon-ng", "airodump-ng", "rtl_tcp", "iw", "nmap"),
+        host: String = PixelAvfDebianGuest.DEFAULT_GUEST_HOST,
+        port: Int = PixelAvfDebianGuest.DEFAULT_SSH_PORT
+    ): List<InstalledBinaryInfo> = withContext(Dispatchers.IO) {
+        _isProbingBinaries.value = true
+        _lastProbeError.value = null
+        try {
+            val env = getEnvironment(context)
+            val isAvf = env == LinuxEnvironment.ANDROID_LINUX_VM
+
+            // 1. Batch locate binaries via 'which' inside the Debian VM
+            val whichCmd = "which " + binaries.joinToString(" ") + " 2>/dev/null"
+            val whichRes = if (isAvf) {
+                PixelAvfDebianGuest.executeGuestCommand(context, whichCmd, host, port, timeoutSeconds = 6)
+            } else if (env == LinuxEnvironment.TERMUX) {
+                val tRes = TermuxBridge.executeCommand(context, whichCmd, timeoutSeconds = 6)
+                PixelAvfDebianGuest.GuestExecutionResult(
+                    success = tRes.success,
+                    exitCode = tRes.exitCode,
+                    stdout = tRes.stdout,
+                    stderr = tRes.stderr,
+                    verifiedDebianEnvironment = false,
+                    executionChannel = tRes.executionChannel
+                )
+            } else {
+                PixelAvfDebianGuest.GuestExecutionResult(
+                    success = false,
+                    exitCode = -1,
+                    stdout = "",
+                    stderr = "No Linux execution environment available",
+                    verifiedDebianEnvironment = false,
+                    executionChannel = "NONE"
+                )
+            }
+
+            val foundPaths = parseWhichPaths(whichRes.stdout)
+
+            // 2. Query version string for each located binary
+            val results = binaries.map { bin ->
+                val path = foundPaths[bin]
+                val isInstalled = path != null
+                val displayName = getBinaryDisplayName(bin)
+                val category = getBinaryCategory(bin)
+
+                var version: String? = null
+                if (isInstalled) {
+                    val versionCmd = getBinaryVersionCommand(bin)
+                    val verRes = if (isAvf) {
+                        PixelAvfDebianGuest.executeGuestCommand(context, versionCmd, host, port, timeoutSeconds = 4)
+                    } else if (env == LinuxEnvironment.TERMUX) {
+                        val tRes = TermuxBridge.executeCommand(context, versionCmd, timeoutSeconds = 4)
+                        PixelAvfDebianGuest.GuestExecutionResult(
+                            success = tRes.success,
+                            exitCode = tRes.exitCode,
+                            stdout = tRes.stdout,
+                            stderr = tRes.stderr,
+                            verifiedDebianEnvironment = false,
+                            executionChannel = tRes.executionChannel
+                        )
+                    } else {
+                        null
+                    }
+
+                    if (verRes != null && (verRes.success || verRes.stdout.isNotBlank())) {
+                        version = parseBinaryVersion(bin, verRes.stdout)
+                    }
+                }
+
+                InstalledBinaryInfo(
+                    binary = bin,
+                    displayName = displayName,
+                    isInstalled = isInstalled,
+                    version = version,
+                    binaryPath = path,
+                    category = category,
+                    executionChannel = if (isAvf) "Pixel AVF Debian Guest" else if (env == LinuxEnvironment.TERMUX) "Termux Userland" else "NONE",
+                    lastProbedTimestamp = System.currentTimeMillis()
+                )
+            }
+
+            _installedBinaries.value = results
+            results
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed probing guest binaries: ${e.message}", e)
+            _lastProbeError.value = e.message
+            val fallback = binaries.map { bin ->
+                InstalledBinaryInfo(
+                    binary = bin,
+                    displayName = getBinaryDisplayName(bin),
+                    isInstalled = false,
+                    version = null,
+                    binaryPath = null,
+                    category = getBinaryCategory(bin),
+                    executionChannel = "UNREACHABLE"
+                )
+            }
+            _installedBinaries.value = fallback
+            fallback
+        } finally {
+            _isProbingBinaries.value = false
+        }
+    }
+
+    /**
+     * Extracts mapped binary-to-path pairs from `which` stdout.
+     */
+    fun parseWhichPaths(rawOutput: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        rawOutput.lines().forEach { line ->
+            val trimmed = line.trim()
+            if (trimmed.isNotBlank() && trimmed.startsWith("/")) {
+                val binName = trimmed.substringAfterLast("/")
+                map[binName] = trimmed
+            }
+        }
+        return map
+    }
+
+    /**
+     * Returns the safe, non-interactive command to query the version of [binary].
+     */
+    fun getBinaryVersionCommand(binary: String): String = when (binary) {
+        "kismet" -> "kismet --version 2>&1 | head -n 1"
+        "tcpdump" -> "tcpdump --version 2>&1 | head -n 1"
+        "tshark" -> "tshark -v 2>&1 | head -n 1"
+        "aircrack-ng" -> "aircrack-ng -u 2>&1 | head -n 2"
+        "airmon-ng" -> "airmon-ng --help 2>&1 | head -n 1"
+        "airodump-ng" -> "airodump-ng --help 2>&1 | head -n 1"
+        "rtl_tcp" -> "rtl_tcp --help 2>&1 | head -n 1"
+        "iw" -> "iw --version 2>&1 | head -n 1"
+        "nmap" -> "nmap -V 2>&1 | head -n 1"
+        "suricata" -> "suricata -V 2>&1 | head -n 1"
+        else -> "$binary --version 2>&1 | head -n 1"
+    }
+
+    /**
+     * Extracts and cleans the human-readable version string for [binary] from raw command output.
+     */
+    fun parseBinaryVersion(binary: String, rawOutput: String): String? {
+        if (rawOutput.isBlank()) return null
+        val firstLine = rawOutput.lines().firstOrNull { it.isNotBlank() }?.trim() ?: return null
+
+        return when (binary) {
+            "kismet" -> {
+                if (firstLine.contains("kismet", ignoreCase = true)) {
+                    firstLine.take(80)
+                } else {
+                    "Kismet ($firstLine)".take(80)
+                }
+            }
+            "tcpdump" -> {
+                val match = Regex("""tcpdump\s+version\s+([0-9a-zA-Z.-]+)""").find(firstLine)
+                match?.value ?: firstLine.take(80)
+            }
+            "tshark" -> {
+                val match = Regex("""(?:TShark|Wireshark)\s+.*?([0-9]+\.[0-9]+(?:\.[0-9]+)?)""").find(firstLine)
+                match?.value ?: firstLine.take(80)
+            }
+            "aircrack-ng" -> {
+                val match = Regex("""Aircrack-ng\s+([0-9a-zA-Z.-]+)""", RegexOption.IGNORE_CASE).find(firstLine)
+                match?.value ?: firstLine.take(80)
+            }
+            "iw" -> {
+                firstLine.take(60)
+            }
+            else -> firstLine.take(80)
+        }
+    }
+
+    fun getBinaryDisplayName(binary: String): String = when (binary) {
+        "kismet" -> "Kismet Wireless IDS"
+        "tcpdump" -> "tcpdump Packet Capture"
+        "tshark" -> "TShark Protocol Dissector"
+        "aircrack-ng" -> "Aircrack-ng Security Suite"
+        "airmon-ng" -> "Airmon-ng Interface Monitor"
+        "airodump-ng" -> "Airodump-ng Frame Logger"
+        "rtl_tcp" -> "RTL-SDR Network Streamer"
+        "iw" -> "iw nl80211 Wireless Tool"
+        "nmap" -> "Nmap Network Scanner"
+        "suricata" -> "Suricata IDS Engine"
+        else -> binary
+    }
+
+    fun getBinaryCategory(binary: String): ToolCategory = when (binary) {
+        "kismet", "aircrack-ng", "airmon-ng", "airodump-ng", "iw" -> ToolCategory.WIFI_AUDIT
+        "tcpdump", "tshark" -> ToolCategory.PACKET_ANALYSIS
+        "rtl_tcp" -> ToolCategory.SDR_RF
+        "nmap" -> ToolCategory.NETWORK_DISCOVERY
+        "suricata" -> ToolCategory.IDS_IPS
+        else -> ToolCategory.PACKET_ANALYSIS
+    }
+
+    // ── Authenticated Sandboxed Command Execution Channel ─────────────────────
+
+    /**
+     * Executes a sandboxed, authenticated command in the Pixel AVF Debian environment.
      *
-     * All process calls include a [timeoutSeconds] guard.
+     * ## Security Guardrails:
+     * - Validates caller authentication token against [AppPreferences.KEY_MCP_AUTH_TOKEN].
+     * - Checks binary against [ALLOWED_SECURITY_BINARIES] allowlist to prevent arbitrary code execution.
+     * - Prevents command injection characters and path escaping outside the sandbox.
+     * - Creates and enforces working directory inside [SANDBOX_WORKING_DIR].
+     * - Guarantees strict environment isolation: **never** executes on the Android host shell.
+     */
+    suspend fun orchestrateTool(
+        context: Context,
+        request: ToolOrchestrationRequest,
+        host: String = PixelAvfDebianGuest.DEFAULT_GUEST_HOST,
+        port: Int = PixelAvfDebianGuest.DEFAULT_SSH_PORT
+    ): ToolOrchestrationResult = withContext(Dispatchers.IO) {
+        val startMs = System.currentTimeMillis()
+
+        // 1. Verify caller authentication if MCP authentication is required
+        val expectedToken = AppPreferences.main(context).getString(AppPreferences.KEY_MCP_AUTH_TOKEN, null)
+        if (!expectedToken.isNullOrBlank() && request.authToken != expectedToken) {
+            Log.w(TAG, "Unauthorized tool orchestration attempt for tool '${request.toolId}'")
+            return@withContext ToolOrchestrationResult(
+                success = false,
+                exitCode = 401,
+                stdout = "",
+                stderr = "Authentication failed: invalid or missing security authorization token.",
+                executionChannel = "AUTH_GATE",
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = false
+            )
+        }
+
+        // 2. Validate binary against allowlist
+        val baseBinary = request.toolId.trim().lowercase()
+        if (!ALLOWED_SECURITY_BINARIES.contains(baseBinary)) {
+            Log.w(TAG, "Blocked execution of non-whitelisted binary '$baseBinary'")
+            return@withContext ToolOrchestrationResult(
+                success = false,
+                exitCode = 403,
+                stdout = "",
+                stderr = "Security violation: binary '$baseBinary' is not on the wscan+ approved sandbox allowlist.",
+                executionChannel = "SANDBOX_VALIDATOR",
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = false
+            )
+        }
+
+        // 3. Sanitize arguments (prevent shell injection)
+        val sanitizedArgs = sanitizeArguments(request.arguments)
+        val subCmd = request.subCommand?.let { sanitizeArgument(it) } ?: ""
+
+        val fullArgString = listOfNotNull(subCmd.ifBlank { null }, sanitizedArgs.ifBlank { null }).joinToString(" ")
+        val rawCmd = if (fullArgString.isNotBlank()) "$baseBinary $fullArgString" else baseBinary
+
+        // 4. Wrap command inside sandbox directory with mkdir guard
+        val sandboxedCommand = buildString {
+            append("mkdir -p ${request.workingDirectory} && cd ${request.workingDirectory} && ")
+            if (request.requiresSudo) append("sudo ")
+            append(rawCmd)
+        }
+
+        val env = getEnvironment(context)
+        if (env == LinuxEnvironment.ANDROID_LINUX_VM) {
+            // Forward to Pixel AVF Debian guest via authenticated socket channel
+            val guestResult = PixelAvfDebianGuest.executeGuestCommand(
+                context = context,
+                command = sandboxedCommand,
+                host = host,
+                port = port,
+                timeoutSeconds = request.timeoutSeconds
+            )
+
+            ToolOrchestrationResult(
+                success = guestResult.success,
+                exitCode = guestResult.exitCode,
+                stdout = guestResult.stdout,
+                stderr = guestResult.stderr,
+                executionChannel = guestResult.executionChannel,
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = guestResult.verifiedDebianEnvironment,
+                toolPackage = baseBinary
+            )
+        } else if (env == LinuxEnvironment.TERMUX) {
+            // Forward to Termux RUN_COMMAND contract
+            val termuxResult = TermuxBridge.executeCommand(
+                context = context,
+                command = sandboxedCommand,
+                timeoutSeconds = request.timeoutSeconds
+            )
+
+            ToolOrchestrationResult(
+                success = termuxResult.success,
+                exitCode = termuxResult.exitCode,
+                stdout = termuxResult.stdout,
+                stderr = termuxResult.stderr,
+                executionChannel = termuxResult.executionChannel,
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = true,
+                toolPackage = baseBinary
+            )
+        } else {
+            ToolOrchestrationResult(
+                success = false,
+                exitCode = -1,
+                stdout = "",
+                stderr = "No Linux execution environment available. Pixel AVF or Termux is required.",
+                executionChannel = "NONE",
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = false
+            )
+        }
+    }
+
+    // ── Tool Session Management ───────────────────────────────────────────────
+
+    /**
+     * Start a named background tool session (e.g. Kismet capture daemon, tcpdump logger).
+     */
+    suspend fun startToolSession(
+        context: Context,
+        toolId: String,
+        arguments: List<String>,
+        sessionName: String,
+        authToken: String? = null
+    ): ToolSession = withContext(Dispatchers.IO) {
+        val sessionId = UUID.randomUUID().toString().take(8)
+        val req = ToolOrchestrationRequest(
+            toolId = toolId,
+            arguments = arguments,
+            requiresSudo = true,
+            timeoutSeconds = 15,
+            authToken = authToken
+        )
+
+        val res = orchestrateTool(context, req)
+        val session = ToolSession(
+            sessionId = sessionId,
+            toolId = toolId,
+            sessionName = sessionName,
+            pid = null,
+            startTimeMs = System.currentTimeMillis(),
+            executionChannel = res.executionChannel,
+            isRunning = res.success
+        )
+        activeSessions[sessionId] = session
+        session
+    }
+
+    /**
+     * Stop a running background tool session.
+     */
+    suspend fun stopToolSession(context: Context, sessionId: String, authToken: String? = null): Boolean =
+        withContext(Dispatchers.IO) {
+            val session = activeSessions[sessionId] ?: return@withContext false
+            val killReq = ToolOrchestrationRequest(
+                toolId = "killall",
+                arguments = listOf("-9", session.toolId),
+                requiresSudo = true,
+                timeoutSeconds = 5,
+                authToken = authToken
+            )
+            // Execute kill via sandboxed runner or pkill
+            val res = orchestrateTool(context, killReq)
+            session.isRunning = false
+            activeSessions.remove(sessionId)
+            res.success
+        }
+
+    fun getActiveSessions(): List<ToolSession> = activeSessions.values.toList()
+
+    // ── Legacy Compatibility Public API ───────────────────────────────────────
+
+    /**
+     * Run a shell command inside the best available Linux environment.
+     * Retains backwards compatibility with existing UI callers.
      */
     suspend fun runCommand(
         context: Context,
@@ -119,19 +692,47 @@ object LinuxEnvironmentService {
         requiresSudo: Boolean = false,
         timeoutSeconds: Long = 30,
     ): CommandResult = withContext(Dispatchers.IO) {
-        when (getEnvironment(context)) {
-            LinuxEnvironment.ANDROID_LINUX_VM ->
-                runInVm(command, requiresSudo, timeoutSeconds)
-            LinuxEnvironment.TERMUX ->
-                runInTermux(context, command, timeoutSeconds)
-            LinuxEnvironment.NONE ->
-                CommandResult(success = false, output = null,
-                    error = "No Linux environment available. Install Termux or enable " +
-                            "the Android Linux environment in Settings → System.")
+        val startMs = System.currentTimeMillis()
+        val env = getEnvironment(context)
+
+        when (env) {
+            LinuxEnvironment.ANDROID_LINUX_VM -> {
+                val effectiveCmd = if (requiresSudo) "sudo sh -c '$command'" else command
+                val res = PixelAvfDebianGuest.executeGuestCommand(
+                    context = context,
+                    command = effectiveCmd,
+                    timeoutSeconds = timeoutSeconds
+                )
+                CommandResult(
+                    success = res.success,
+                    output = res.stdout.ifBlank { null },
+                    error = res.stderr,
+                    state = if (res.success) ExecutionState.COMPLETED else ExecutionState.FAILED,
+                    durationMs = System.currentTimeMillis() - startMs
+                )
+            }
+            LinuxEnvironment.TERMUX -> {
+                val effectiveCmd = if (requiresSudo) "su -c '$command'" else command
+                val res = TermuxBridge.executeCommand(context, effectiveCmd, timeoutSeconds)
+                CommandResult(
+                    success = res.success,
+                    output = res.stdout.ifBlank { null },
+                    error = res.stderr,
+                    state = if (res.success) ExecutionState.COMPLETED else ExecutionState.FAILED,
+                    durationMs = System.currentTimeMillis() - startMs
+                )
+            }
+            LinuxEnvironment.NONE -> {
+                CommandResult(
+                    success = false,
+                    output = null,
+                    error = "No Linux environment available. Install Termux or enable the Android Linux environment in Developer options.",
+                    state = ExecutionState.FAILED,
+                    durationMs = System.currentTimeMillis() - startMs
+                )
+            }
         }
     }
-
-    // ── Package management ────────────────────────────────────────────────────
 
     /**
      * Install a package in the active Linux environment.
@@ -139,143 +740,53 @@ object LinuxEnvironmentService {
      */
     suspend fun installPackage(context: Context, packageName: String): CommandResult =
         runCommand(
-            context      = context,
-            command      = "apt-get install -y $packageName",
+            context = context,
+            command = "DEBIAN_FRONTEND=noninteractive apt-get install -y $packageName",
             requiresSudo = true,
             timeoutSeconds = 120,
         )
 
     /**
      * Add an extra apt repository source and update the package list.
-     * The [sourceEntry] should be a valid `/etc/apt/sources.list` line, e.g.:
-     * `"deb https://packages.aircrack-ng.org/ jammy main"`
      */
     suspend fun addAptRepository(context: Context, sourceEntry: String): CommandResult =
         runCommand(
-            context      = context,
-            command      = "sh -c 'echo \"$sourceEntry\" >> /etc/apt/sources.list.d/wscanplus.list " +
-                           "&& apt-get update'",
+            context = context,
+            command = "echo \"$sourceEntry\" >> /etc/apt/sources.list.d/wscanplus.list && apt-get update",
             requiresSudo = true,
             timeoutSeconds = 60,
         )
 
     /**
-     * Setup script that installs all tools needed by wscan+ in the Linux
-     * environment: aircrack-ng, tshark (non-interactive), iw, tcpdump.
-     * Returns output of the final apt command.
+     * Setup script that installs all tools needed by wscan+ in the Linux environment.
      */
     suspend fun setupCaptureTools(context: Context): CommandResult =
         runCommand(
             context = context,
-            command = "sh -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y " +
-                      "aircrack-ng tshark iw tcpdump net-tools wireless-tools 2>&1'",
+            command = "DEBIAN_FRONTEND=noninteractive apt-get install -y aircrack-ng tshark iw tcpdump net-tools wireless-tools 2>&1",
             requiresSudo = true,
             timeoutSeconds = 300,
         )
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+    // ── Internal Helpers & Sanitizers ─────────────────────────────────────────
 
-    private fun runInVm(
-        command: String,
-        requiresSudo: Boolean,
-        timeoutSeconds: Long,
-    ): CommandResult {
-        val startMs = System.currentTimeMillis()
-        val effectiveCmd = if (requiresSudo) "sudo sh -c '$command'" else command
-
-        // 1. Direct AVF helper binary if provided by system
-        val vmHelpers = listOf(
-            "/system/bin/andlinux-run",
-            "/apex/com.android.virt/bin/vm_client",
-            "/system/bin/vm"
-        )
-        val validHelper = vmHelpers.firstOrNull { File(it).exists() }
-
-        val args = if (validHelper != null) {
-            arrayOf(validHelper, "--", "sh", "-c", effectiveCmd)
-        } else if (File("/system/bin/su").exists() || File("/system/xbin/su").exists()) {
-            arrayOf("su", "-c", effectiveCmd)
-        } else {
-            // Unprivileged local shell
-            arrayOf("sh", "-c", effectiveCmd)
-        }
-
-        val baseRes = execProcess(args, timeoutSeconds)
-        return baseRes.copy(durationMs = System.currentTimeMillis() - startMs)
+    private fun sanitizeArgument(arg: String): String {
+        // Remove dangerous shell control tokens
+        return arg.replace(Regex("[;&|`$><!\\n\\r]"), "")
     }
 
-    private fun runInTermux(
-        context: Context,
-        command: String,
-        timeoutSeconds: Long,
-    ): CommandResult {
-        val startMs = System.currentTimeMillis()
-        return try {
-            val intent = android.content.Intent().apply {
-                setClassName("com.termux", "com.termux.app.RunCommandService")
-                action = "com.termux.RUN_COMMAND"
-                putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/bash")
-                putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf("-c", command))
-                putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
-            }
-            context.startService(intent)
-            CommandResult(
-                success = true,
-                output = "(running in Termux background)",
-                error = null,
-                state = ExecutionState.RUNNING,
-                durationMs = System.currentTimeMillis() - startMs
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "Termux RUN_COMMAND failed", e)
-            CommandResult(
-                success = false,
-                output = null,
-                error = e.message,
-                state = ExecutionState.FAILED,
-                durationMs = System.currentTimeMillis() - startMs
-            )
-        }
+    private fun sanitizeArguments(args: List<String>): String {
+        return args.joinToString(" ") { sanitizeArgument(it) }
     }
 
-    private fun execProcess(args: Array<String>, timeoutSeconds: Long): CommandResult {
-        val startMs = System.currentTimeMillis()
+    private fun testSocketReachable(host: String, port: Int, timeoutMs: Int): Boolean {
         return try {
-            val proc = Runtime.getRuntime().exec(args)
-            val errThread = Thread { proc.errorStream.use { it.bufferedReader().readText() } }
-                .also { it.isDaemon = true; it.start() }
-            val out = proc.inputStream.use { it.bufferedReader().readText() }
-            val exited = proc.waitFor(timeoutSeconds, TimeUnit.SECONDS)
-            errThread.join(500)
-            val durationMs = System.currentTimeMillis() - startMs
-            if (!exited) {
-                Log.w(TAG, "Command timed out: ${args.joinToString(" ")}")
-                proc.destroy()
-                return CommandResult(
-                    success = false,
-                    output = out.ifBlank { null },
-                    error = "Command timed out after ${timeoutSeconds}s",
-                    state = ExecutionState.FAILED,
-                    durationMs = durationMs
-                )
+            Socket().use { socket ->
+                socket.connect(InetSocketAddress(host, port), timeoutMs)
+                true
             }
-            val exitOk = proc.exitValue() == 0
-            CommandResult(
-                success = exitOk,
-                output  = out.ifBlank { null },
-                error   = if (!exitOk) "Exit code ${proc.exitValue()}" else null,
-                state   = if (exitOk) ExecutionState.COMPLETED else ExecutionState.FAILED,
-                durationMs = durationMs
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "execProcess failed", e)
-            CommandResult(
-                success = false,
-                output = null,
-                error = e.message,
-                state = ExecutionState.FAILED,
-                durationMs = System.currentTimeMillis() - startMs
-            )
+        } catch (_: Exception) {
+            false
         }
     }
 

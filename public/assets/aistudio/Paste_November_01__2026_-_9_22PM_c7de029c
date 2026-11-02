@@ -1,0 +1,331 @@
+Interaction and Control of an “AVF Terminal” from an Android App
+
+Executive summary
+
+The term “AVF terminal” is materially ambiguous, and the integration strategy changes completely depending on what “AVF” means. The strongest official match I found is Android Virtualization Framework (AVF): Android now ships a Linux Terminal experience backed by an AVF virtual machine. In that architecture, the Android Terminal app launches and manages a VM, discovers the guest’s ttyd terminal service, and loads the service in a WebView; current AOSP code discovers a service named ttyd of type _http._tcp and connects to its advertised IP address and port. AVF itself exposes VM-management APIs and a host↔guest communication path using Binder over vsock. citeturn228017search0turn228017search6turn228017search9turn614097search1
+
+This interpretation is substantially more plausible than Apple AVFoundation. Apple’s AVFoundation is an audiovisual-media framework for Apple platforms, not an Android terminal-control or payment-terminal protocol. citeturn752695search0turn752695search1 I did not find authoritative primary documentation for a payment-terminal product family literally branded “AVF,” so a payment-device interpretation should not be locked in until the actual manufacturer and model are known.
+
+If the target really is the Android AVF Linux Terminal, a normal third-party Android application cannot simply instantiate or control protected AVF VMs in the same way the system Terminal app does. AOSP states that only apps signed with the platform key can obtain permission to create, own, or interact with protected VMs, and the Terminal app itself requests privileged permissions including MANAGE_VIRTUAL_MACHINE and USE_CUSTOM_VIRTUAL_MACHINE. citeturn614097search0turn614097search2 Consequently, the robust architecture is either: a platform/OEM-signed application using the AVF Java APIs directly; or a privileged broker/service exposing a narrow IPC interface to an ordinary application. Trying to automate the stock Terminal application’s WebView or depend on undocumented ttyd internals is much less stable.
+
+If “AVF terminal” instead means a payment terminal, the integration should generally use the vendor’s SDK or Terminal API rather than sending raw EMV commands. Current mainstream models illustrate the pattern: Stripe Terminal supports Android SDK integration with Bluetooth, USB on Android for supported mobile readers, and internet-connected readers; Adyen supports local HTTPS Terminal API calls, cloud communication via terminal-established WebSockets, and Android apps running directly on certain terminals; Square exposes Android APIs for Bluetooth, USB, audio and embedded/Tap-to-Pay readers. citeturn207997search0turn825946search0turn825946search17turn825946search6
+
+The engineering recommendation is therefore to introduce a terminal-adapter abstraction above all physical transports. Keep transaction state, retries, idempotency, security policy and telemetry independent of USB/Bluetooth/TCP, and implement either an AvfVmAdapter or a vendor-specific payment adapter beneath it. That prevents an early misunderstanding of “AVF” from contaminating the rest of the application architecture.
+
+Meaning of AVF and likely terminal types
+
+Android Virtualization Framework Terminal
+
+Android’s AVF provides isolated VM execution using components including pKVM, crosvm, VirtualizationService and Microdroid/custom guests. AVF is supported only on ARM64 devices, and its Java APIs are present only on devices supporting the framework. citeturn228017search0
+
+Google’s Linux Terminal implementation uses AVF to create a Debian-based VM. The official architecture describes the Android Terminal application, the AVF VM, a guest agent and ttyd; the Terminal application connects a WebView to a web service inside the VM. citeturn785603search0turn228017search1 Current AOSP code goes further: it searches with Android NsdManager for an _http._tcp service named ttyd, extracts its IP address and port, and loads that URL into the terminal view. citeturn228017search6turn614097search8
+
+Earlier source revisions connected to port 7681 after obtaining the VM IP address, and the current Terminal application still contains explicit terminal service handling around ttyd. citeturn228017search2turn228017search4 These implementation details are useful for understanding the architecture, but they should not be treated as a stable public protocol contract unless Google documents them as such.
+
+The lower-level, supported AVF communication model is significantly cleaner: a host application creates or obtains a VirtualMachine, starts it, waits for the payload-ready callback and connects to a service in the guest with connectToVsockServer(), typically exposing a custom AIDL service over the returned Binder channel. citeturn228017search9 VirtualizationService documents vsock as the primary VM communication mechanism and notes that the VM context identifier can be recycled after termination, so code should not persist CIDs as durable endpoint identities. citeturn614097search1
+
+Apple AVFoundation
+
+Apple AVFoundation covers audiovisual assets, media capture, playback, audio, cameras and media processing on Apple operating systems. It is not an Android interface and is not an external terminal-control API. citeturn752695search0turn752695search1 If someone internally abbreviates an audiovisual appliance or system as “AVF,” that would be a project-specific acronym and requires manufacturer documentation before protocol assumptions can be made.
+
+Payment-terminal interpretation
+
+No primary vendor documentation I found establishes a payment-terminal brand or model family simply called “AVF.” For comparison, mainstream vendors explicitly name their integration surfaces and hardware. Stripe lists readers such as WisePOS E, Stripe Reader S700/S710/M2 and WisePad 3 depending on region, and exposes the Stripe Terminal SDK. citeturn207997search1 Adyen exposes its Terminal API and supports local or cloud communications. citeturn825946search7turn825946search11 Square’s Mobile Payments SDK exposes reader information including model, serial number, firmware, supported entry methods and connection type. citeturn825946search6 Handpoint supports Android integrations for devices including HiLite, multiple PAX Android terminals and Telpo TPS900. citeturn785603search10turn785603search11
+
+Accordingly, for an unknown “AVF payment terminal,” the first integration milestone should be device identification, not protocol implementation: capture manufacturer, exact model, USB VID/PID if applicable, Bluetooth advertised name/service UUIDs, firmware version, network discovery behavior and any SDK package installed on the terminal.
+
+Protocols, SDKs and vendor comparison
+
+Target / vendor	Primary integration surface	USB	Bluetooth Classic / BLE	TCP/IP	WebSocket	Serial / RS-232	NFC	Android-app control model
+
+Android AVF Terminal	AVF Java API + Binder/vsock; stock Terminal UI via ttyd/HTTP	Not the normal host↔guest path	No normal role in VM control	Yes, guest service networking exists	ttyd may use browser-internal mechanisms, but AOSP documents the terminal UI endpoint as HTTP rather than a stable WebSocket control API	No	No	Privileged/platform integration required for direct pVM control. citeturn228017search9turn614097search1turn614097search2
+AOSP Terminal application	NsdManager discovery of _http._tcp / ttyd, then WebView	No	No	Yes	Do not rely on internal browser protocol as public API	No	No	System Terminal app owns VM lifecycle and terminal UI. citeturn228017search6turn614097search0
+Stripe Terminal	Android Terminal SDK / server-driven integration	Yes for supported Android/mobile-reader configurations	Yes	Yes for smart readers	Vendor-managed internals	Not exposed as preferred integration	Tap to Pay on Android	SDK abstracts reader protocol and payment flow. citeturn207997search0turn207997search1
+Adyen	Terminal API; local HTTPS or cloud	Hardware-dependent	Not the main Terminal API mechanism	Yes	Cloud terminals maintain a WebSocket connection to Adyen	Hardware-dependent	Tap to Pay / terminal contactless	Local calls go to terminal /nexo on port 8443; Android-on-terminal apps may use localhost. citeturn825946search0turn825946search17
+Square	Mobile Payments SDK	Supported reader types report USB	Bluetooth readers supported	Backend connectivity required for many operations	SDK-internal	No public raw serial API	Tap to Pay and contactless readers	SDK exposes ReaderManager and payment APIs. citeturn825946search6turn825946search1
+Handpoint / PAX ecosystem	Vendor Android SDK, Cloud API, REST depending on terminal	Supported on some hardware	HiLite supports Bluetooth	Wi-Fi/cellular/Ethernet vary by model	Vendor-specific	Vendor-specific	Terminal-owned	SDK/API should be used rather than raw reader command access. citeturn785603search10turn785603search11
+Generic USB serial terminal	Android USB Host + vendor command protocol	Yes	Optional	Optional	Optional	Yes via CDC/ACM, FTDI, CP210x, CH34x, etc.	Optional	Requires actual device command specification; Android USB alone only provides transport. citeturn785603search3turn808427search0
+
+
+The architectural distinction is important: transport and command protocol are separate layers. USB Host gives Android endpoint access, Bluetooth RFCOMM gives a byte stream, BLE gives GATT characteristics, and TCP gives sockets; none of those defines the terminal’s business commands. For an unknown terminal you still need the manufacturer’s framing, command identifiers, checksums, timeouts, state machine and security requirements.
+
+For AVF specifically, the command layer should preferably be your own AIDL/RPC service in the guest rather than terminal keystrokes. AOSP’s supported AVF application example creates a VM, waits for onPayloadReady, connects through vsock and invokes an AIDL method. citeturn228017search9 That gives typed requests, structured errors and explicit authorization instead of scraping a shell.
+
+A minimal Java-style AVF host flow is structurally:
+
+VirtualMachineConfig config =  
+    new VirtualMachineConfig.Builder(context, "assets/vm_config.json").build();  
+  
+VirtualMachine vm =  
+    VirtualMachineManager.getInstance(context)  
+        .getOrCreate("terminal_vm", config);  
+  
+vm.setCallback(executor, new VirtualMachineCallback() {  
+    @Override  
+    public void onPayloadReady(VirtualMachine vm) {  
+        try {  
+            IBinder binder = vm.connectToVsockServer(PORT).get();  
+            ITerminalControl svc = ITerminalControl.Stub.asInterface(binder);  
+  
+            TerminalResult result =  
+                svc.execute(new TerminalCommand("status"));  
+        } catch (Exception e) {  
+            // map to domain error / trigger recovery  
+        }  
+    }  
+});  
+  
+vm.run();
+
+This pattern follows the official AVF host↔guest API shape; it is not, however, generally available to an ordinary Play-distributed third-party application because of AVF’s privilege model. citeturn228017search9turn614097search2
+
+A stock-Terminal discovery prototype could mirror the current AOSP mechanism:
+
+val nsd = getSystemService(NsdManager::class.java)  
+  
+val info = NsdServiceInfo().apply {  
+    serviceType = "_http._tcp"  
+    serviceName = "ttyd"  
+}  
+  
+nsd.registerServiceInfoCallback(  
+    info,  
+    executor,  
+    object : NsdManager.ServiceInfoCallback {  
+        override fun onServiceUpdated(service: NsdServiceInfo) {  
+            val host = service.hostAddresses.firstOrNull() ?: return  
+            val endpoint = "http://${host.hostAddress}:${service.port}"  
+            // Prefer using this only for diagnostics/UI integration,  
+            // not as a durable command API.  
+        }  
+  
+        override fun onServiceLost() {}  
+        override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {}  
+        override fun onServiceInfoCallbackUnregistered() {}  
+    }  
+)
+
+That shape reflects current Terminal application source using NsdManager and the ttyd service. citeturn228017search6 On modern Android, mDNS/local-network permissions need careful version handling; Android 17/API 37 adds ACCESS_LOCAL_NETWORK restrictions and allows user-approved per-service access through newer NsdManager discovery flows. citeturn614097search7
+
+For a generic Bluetooth Classic terminal, Android’s supported stream transport is RFCOMM through BluetoothSocket; an unpaired device can trigger the system pairing dialog automatically during connection. citeturn808427search13turn808427search26 A transport adapter can therefore be as simple as:
+
+class RfcommTransport(  
+    private val device: BluetoothDevice,  
+    private val serviceUuid: UUID  
+) {  
+    private var socket: BluetoothSocket? = null  
+  
+    fun connect() {  
+        val s = device.createRfcommSocketToServiceRecord(serviceUuid)  
+        s.connect()  
+        socket = s  
+    }  
+  
+    fun send(frame: ByteArray): ByteArray {  
+        val s = requireNotNull(socket)  
+        s.outputStream.write(frame)  
+        s.outputStream.flush()  
+  
+        val buffer = ByteArray(4096)  
+        val n = s.inputStream.read(buffer)  
+        return buffer.copyOf(n)  
+    }  
+  
+    fun close() {  
+        socket?.close()  
+        socket = null  
+    }  
+}
+
+The actual frame format must come from the terminal manufacturer. Android only supplies the RFCOMM pipe. citeturn808427search13turn808427search31
+
+For USB serial devices, Android USB Host supplies raw device/interface/endpoint access; a widely used open-source Java library, usb-serial-for-android, adds CDC/ACM and common converter drivers such as FTDI, PL2303, CP210x and CH34x without root. citeturn785603search5turn808427search0 It should be treated as a transport library rather than a payment or AVF SDK.
+
+Android permissions, pairing and connection lifecycle
+
+For AVF, the stock Terminal manifest requests MANAGE_VIRTUAL_MACHINE, USE_CUSTOM_VIRTUAL_MACHINE, INTERNET, ACCESS_NETWORK_STATE, foreground-service permissions, notification permission and other capabilities. It also declares android.software.virtualization_framework as a required feature. citeturn614097search0 The key limitation is not ordinary runtime permission handling but privileged authorization: AOSP says platform-key-signed apps are the ones that can request permission to create, own or interact with pVMs. citeturn614097search2
+
+For USB Host, declare the USB host feature and either listen for USB_DEVICE_ATTACHED with a VID/PID filter or enumerate UsbManager.deviceList. Android requires user permission before opening a USB device unless permission was granted through handling the attachment intent. citeturn785603search3turn785603search6 A robust workflow is attach → identify VID/PID/interfaces → request permission → openDevice() → claim interface → start I/O → handle detach → close all endpoints and reset connection state.
+
+For Bluetooth on Android 12/API 31 and later, scanning and connecting use the nearby-device permission model, notably BLUETOOTH_SCAN and BLUETOOTH_CONNECT; Android 11 and below used legacy Bluetooth permissions and could require fine location for scanning. citeturn785603search4turn808427search15 Bluetooth Classic terminals generally follow scan → select → system pair/bond → RFCOMM connect → protocol handshake. BLE terminals use connectGatt() and a GATT state machine rather than a byte-stream socket. citeturn808427search22turn808427search26
+
+For NFC, Android exposes NfcAdapter, reader mode and host card emulation. Reader mode can be enabled for a foreground activity through enableReaderMode(). citeturn808427search37turn808427search38 Payment applications should not assume this gives them access to an EMV payment kernel: in certified payment solutions, card data acquisition and kernel processing are typically owned by the vendor’s certified SDK or payment application rather than by arbitrary app NFC code. EMVCo separates Level 1 interface/protocol testing from Level 2 kernel/software testing. citeturn602845search5turn602845search9
+
+For TCP/IP, the application typically needs INTERNET; local terminal discovery may additionally involve NsdManager, Wi-Fi APIs or Android’s local-network permission model depending on target API level. Starting with API 37, Android restricts local-network access and provides explicit user-approved discovery paths for services discovered using NsdManager. citeturn614097search7
+
+For Android Enterprise deployments, a dedicated terminal/controller device can be fully managed, locked into an allowlisted set of apps and remotely configured. Android Enterprise supports dedicated-device/kiosk deployment and managed configurations, which are useful for provisioning terminal IDs, environment endpoints, retry policies and feature flags without embedding them in the APK. citeturn597525search0turn597525search1turn597525search6
+
+A connection state machine should be explicit:
+
+stateDiagram-v2  
+    [*] --> Idle  
+    Idle --> Discovering: connect()  
+    Discovering --> PermissionRequired: permission missing  
+    PermissionRequired --> Discovering: granted  
+    PermissionRequired --> Failed: denied  
+  
+    Discovering --> Pairing: Bluetooth unbonded  
+    Discovering --> Connecting: endpoint found  
+    Pairing --> Connecting: bonded  
+    Pairing --> Failed: pairing timeout/failure  
+  
+    Connecting --> Authenticating: transport open  
+    Authenticating --> Ready: protocol/session accepted  
+    Authenticating --> Backoff: handshake failed  
+  
+    Ready --> Busy: command/transaction  
+    Busy --> Ready: completed  
+    Busy --> Recovering: timeout/link loss  
+    Ready --> Recovering: disconnect  
+  
+    Recovering --> Backoff  
+    Backoff --> Discovering: retry budget remains  
+    Backoff --> Failed: retry budget exhausted  
+  
+    Ready --> Idle: explicit disconnect  
+    Failed --> Idle: reset
+
+This model maps cleanly both to AVF guest-service connections and external terminals; only the discovery, authentication and transport-specific stages change.
+
+Security, payment certification and platform controls
+
+If the target is Android AVF, its most important security property is isolation. AVF is designed to offer stronger isolation than the normal Android application sandbox, and protected VMs are intended to preserve guest confidentiality even if the host Android environment is compromised. citeturn228017search0 Host↔guest access should therefore be deliberately narrow: expose only the operations needed by the application, avoid a generic root shell API, authenticate every high-value RPC and define explicit message schemas.
+
+The Android host itself is already constrained by the application sandbox and SELinux mandatory access control. Android uses SELinux to enforce access control even against processes with root capabilities, and third-party applications execute within separate app security domains. citeturn768854search1turn768854search12 A normal application should not attempt to weaken SELinux policy to gain hardware or VM access; if OEM-level integration requires a vendor daemon, define a minimal SELinux domain and narrowly scoped device-node/Binder permissions.
+
+For secrets, Android Keystore can keep key material non-exportable, with hardware-backed TEE or StrongBox protection where available. StrongBox offers stronger isolation for supported devices. citeturn768854search0turn768854search24 Use it for terminal-client credentials, API client certificates, device identity keys and local data-encryption keys rather than storing private keys in resources or shared preferences.
+
+FIPS is conditional rather than universally required. FIPS 140-3 applies when the deployment contract, regulator or government security profile requires validated cryptography. NIST’s CMVP validates specific cryptographic modules and their documented operating environments; using “AES” or the Android Keystore does not automatically make an application FIPS validated. citeturn768854search14turn768854search18 If FIPS is required, select a device/OS/module combination covered by a current CMVP certificate and ensure all relevant cryptographic services remain inside the validated boundary.
+
+If the terminal is a payment terminal, the compliance model is more demanding. PCI PTS covers point-of-interaction devices, while PCI DSS governs protection of payment account data in the merchant environment; use of a PTS-approved device alone does not automatically remove the integrating system from PCI DSS scope. citeturn785603search13turn785603search15 PCI SSC explicitly notes that SRED-capable PTS devices and validated P2PE solutions can help reduce scope, but an assessor should not assume a terminal is encrypting cardholder data merely because it is PTS approved. citeturn785603search15
+
+For payment acceptance directly on commercial Android hardware, PCI MPoC is the strategic standard. MPoC covers mobile payment acceptance on commercial off-the-shelf devices and combines use cases involving contactless cardholder data and PIN entry. citeturn597525search2 PCI announced a sunset period for the older SPoC and CPoC programs from May 1 through October 31, 2026; existing listings remain valid through their listing lifecycle, but new submissions cease after the sunset period. citeturn597525search31
+
+EMV certification is similarly layered. EMV Level 1 evaluates the physical/electrical/contactless communications interface; Level 2 evaluates the payment application/kernel behavior; Level 3 validates the integrated acceptance-device-to-host/acquirer transaction flow under payment-system test plans. citeturn602845search5turn602845search10 An Android application using an already certified vendor SDK normally relies on the vendor/acquirer’s approved kernel rather than implementing raw EMV APDUs itself.
+
+The payment-security boundary should therefore look like:
+
+flowchart LR  
+    A[Android POS / Business App] -->|amount, reference, intent| B[Vendor SDK / Terminal Adapter]  
+    B -->|certified control channel| C[Payment Terminal / Certified Kernel]  
+    C --> D[Card / Mobile Wallet]  
+    C -->|encrypted/tokenized payment data| E[Acquirer / PSP]  
+    E -->|result + token/reference| B  
+    B -->|sanitized outcome| A  
+  
+    A -. never handles PAN/PIN if avoidable .-> C
+
+Application signing also matters operationally. For managed payment terminals, vendors can impose their own app review and signing/deployment process. Adyen, for example, requires a signed APK before upload to its terminal-management environment and publishes terminal-specific application restrictions. citeturn825946search12turn825946search20
+
+Recommended integration architecture, reliability and performance
+
+The recommended design is a hexagonal/adapter architecture with one transport-independent terminal contract:
+
+UI / Business Workflow  
+        |  
+Transaction Coordinator  
+        |  
+TerminalService  
+        |  
++-----------------------------+  
+| TerminalAdapter interface   |  
+| connect()                   |  
+| capabilities()              |  
+| execute(command, idempotencyKey)  
+| observeEvents()             |  
+| cancel()                    |  
+| disconnect()                |  
++-----------------------------+  
+   |          |          |  
+ AVF       Payment     Generic  
+ Adapter    SDK         Transport  
+   |          |          |  
+vsock/AIDL  vendor SDK  USB/BT/TCP
+
+TransactionCoordinator should own business idempotency, user-visible progress and recovery. The adapter should own protocol framing, transport-specific timeouts and mapping of vendor/VM events into a normalized domain model. This separation is especially valuable here because “AVF” has not yet been resolved to one physical product.
+
+For an AVF implementation, the preferred control path is:
+
+sequenceDiagram  
+    participant App as Android App  
+    participant Broker as Privileged AVF Broker  
+    participant AVF as VirtualMachine / AVF  
+    participant Guest as Guest Control Service  
+  
+    App->>Broker: execute(command, requestId)  
+    Broker->>AVF: getOrCreate(vm)  
+    Broker->>AVF: run()  
+    AVF-->>Broker: onPayloadReady()  
+    Broker->>Guest: connectToVsockServer(port)  
+    Guest-->>Broker: Binder/AIDL interface  
+    Broker->>Guest: execute(command, requestId)  
+    Guest-->>Broker: structured result  
+    Broker-->>App: sanitized result
+
+This is preferable to typing shell commands into ttyd because the AVF Java API already provides a supported VM-to-service communication mechanism through vsock and Binder. citeturn228017search9turn614097search1 The stock ttyd/WebView path is appropriate for human terminal interaction, but it is an implementation surface rather than a durable automation contract. That is an engineering inference from the current AOSP architecture and source. citeturn228017search6turn228017search7
+
+For payment transactions:
+
+sequenceDiagram  
+    participant UI as Android POS  
+    participant TC as Transaction Coordinator  
+    participant SDK as Vendor Terminal Adapter  
+    participant T as Payment Terminal  
+    participant PSP as PSP / Acquirer  
+  
+    UI->>TC: pay(amount, orderId)  
+    TC->>TC: create idempotency key  
+    TC->>SDK: ensureConnected()  
+    SDK->>T: initiate payment  
+    T-->>SDK: present/tap/insert card requested  
+    SDK-->>TC: AwaitingCard  
+    T->>PSP: authorize transaction  
+    PSP-->>T: approved / declined  
+    T-->>SDK: final terminal result  
+    SDK-->>TC: normalized result + PSP reference  
+    TC->>TC: persist final state atomically  
+    TC-->>UI: Approved / Declined / Unknown
+
+The most dangerous error state is unknown outcome, not an ordinary failure. If a socket disappears after the terminal submitted a transaction but before the Android app received its response, blindly repeating the payment can double-charge the customer. Recovery must query transaction status using the same merchant reference/idempotency identifier before retrying a financial operation.
+
+For reconnection, use bounded exponential backoff with jitter for transport failures, but do not apply generic automatic retry to irreversible commands. A practical policy is immediate retries only for discovery/connection establishment; status-query retry for ambiguous transactions; and explicit operator intervention after a bounded number of failures. Square’s SDK, for example, exposes reader state and a dedicated retryConnection() API rather than requiring applications to reconstruct the Bluetooth protocol themselves. citeturn825946search6turn825946search9
+
+For AVF VM failure, monitor the VM callback lifecycle and assume a VM can terminate when its controlling references disappear; VirtualizationService documents that losing all references to the VM handle can cause the VM to be shut down. citeturn614097search1 Persist application-level task state outside the VM if commands must survive host process death.
+
+Performance-wise, local Binder/vsock or on-device app-to-app communication minimizes network round trips; network payment integrations add LAN or WAN latency and availability dependencies. Adyen explicitly distinguishes local communications, where the POS sends requests directly to the terminal on the LAN, from cloud communications, where the POS interacts through Adyen’s cloud. citeturn825946search0turn825946search7 The most important latency metric is therefore not raw transport RTT but end-to-end transaction percentile latency, split into connection setup, terminal interaction, card processing, authorization and final-result propagation.
+
+For BLE, minimize unnecessary reconnects and GATT discovery; for Bluetooth Classic, keep a connection open during a transaction; for USB, avoid opening and closing the interface per command; and for TCP/TLS, reuse connections when supported. Those are engineering recommendations rather than vendor-specific protocol requirements.
+
+Testing strategy, implementation roadmap and compliance checklist
+
+Testing should be layered. At the lowest level, validate frame encoding/decoding with deterministic unit tests and golden vectors. Add transport tests for USB attach/detach, permission denial, Bluetooth disabled, radio loss, pairing cancellation, network change and terminal reboot. Add transaction-state tests for timeout before submission, timeout after submission, duplicate responses, delayed responses and application process death. For AVF, exercise VM boot failure, payload-not-ready, guest-service disappearance, CID changes and broker death. AOSP’s vm debugging tooling can start, inspect and terminate VMs, while debuggable AVF guests expose richer logs and ADB access; production VMs should use non-debuggable mode. citeturn614097search1
+
+For Android Enterprise deployments, test under the actual EMM/device-owner policy because work profiles and fully managed devices can alter intent routing, application availability and device behavior. Android explicitly recommends end-to-end testing with the target EMM for dedicated-device solutions. citeturn597525search6 For payment vendors, use their supported simulator/sandbox when available; Square, for example, provides a Mock Reader UI because physical readers cannot be exercised inside the Square Sandbox. citeturn825946search6
+
+A sensible implementation roadmap is four milestones. Discovery and proof of identity should establish what AVF means, identify exact hardware/software version, determine whether the application can obtain privileged AVF access or must use a vendor SDK, and capture all available protocol documentation. Transport proof of concept should establish one reliable end-to-end connection and one harmless command such as status/version. Production state machine should add idempotency, structured errors, reconnect/recovery, telemetry, secure credential storage, lifecycle handling and automated fault tests. Certification and deployment should complete vendor/acquirer certification, PCI/EMV obligations where relevant, Android Enterprise provisioning, signed production releases, observability dashboards and rollout controls.
+
+The resulting go-live checklist should cover the following:
+
+- Identity and interface: exact vendor/model/firmware recorded; supported SDK/API version pinned; command protocol and framing obtained from an authoritative source; no undocumented shell/UI automation in the critical path.
+- Android permissions: USB permission and detach handling tested where relevant; BLUETOOTH_SCAN/BLUETOOTH_CONNECT handled on modern Android; legacy permission behavior tested on supported older versions; local-network/API-37 behavior accounted for; NFC capability explicitly detected before use. citeturn785603search3turn785603search4turn614097search7turn808427search37
+- AVF security: direct VM management used only by an appropriately privileged/platform-signed component; guest service uses a narrow AIDL/RPC contract; production VM is non-debuggable; no reliance on persistent VM CIDs. citeturn614097search2turn614097search1
+- Secrets: private keys and credentials stored through Android Keystore; StrongBox requested where required and supported; secrets never logged; certificate rotation and expiry monitoring defined. citeturn768854search0turn768854search24
+- Network security: TLS/server identity validation enabled for network terminals; local terminal certificates validated where vendor architecture requires it; no permissive trust manager; sensitive commands authenticated. Adyen’s local integration, for example, requires terminal-certificate validation and encrypted communication using the configured shared key. citeturn825946search23
+- Payment scope: PAN, track data and PIN never exposed to the Android business application unless the certified architecture explicitly requires it; PTS/P2PE/PCI DSS scope confirmed with the acquirer/QSA; MPoC applicability checked for COTS/Tap-to-Pay deployments. citeturn785603search15turn597525search2
+- EMV: approved L1/L2 components used where card acceptance is involved; L3/acquirer certification completed for the intended processor, region, payment methods and terminal configuration. citeturn602845search5turn602845search10
+- FIPS: treated as a contractual/regulatory requirement, not assumed; if required, the exact cryptographic module and operating environment are verified against the NIST CMVP listing. citeturn768854search18
+- Android hardening: SELinux remains enforcing; devices are not rooted; terminal/POS software is deployed through controlled signing and management; Android Enterprise kiosk/dedicated-device controls are used where operationally appropriate. citeturn768854search1turn597525search6
+- Reliability: every command has timeout classification; reconnect uses bounded backoff and jitter; transaction IDs are durable; an “unknown outcome” triggers status reconciliation rather than an automatic duplicate payment.
+- Observability: logs contain terminal model, firmware, connection state, request ID, latency buckets and normalized error code, but no cardholder or authentication secrets.
+- Testing: permission denial, device detach, radio loss, terminal reboot, app process death, network partition, duplicated callback, delayed callback and ambiguous transaction completion all have automated or scripted test cases.
+- Deployment: app signing keys protected; rollback path tested; firmware/SDK compatibility matrix maintained; production rollout staged by site or device cohort; vendor SDK end-of-support dates monitored.
+
+Primary documentation and decision guidance
+
+For an Android AVF Terminal implementation, the authoritative starting points are Google’s AVF overview, the official “Write an AVF app” guide, VirtualizationService documentation, AVF security documentation and current AOSP Terminal application source. Together they document VM creation, vsock/Binder communication, privilege requirements and the Terminal app’s ttyd/NSD architecture. citeturn228017search0turn228017search9turn614097search1turn614097search2turn228017search6
+
+For generic Android connectivity, the primary references are Android’s USB Host documentation, Bluetooth permissions and RFCOMM/GATT APIs, NFC APIs, NsdManager, Android Keystore and Android Enterprise documentation. citeturn785603search3turn785603search4turn808427search13turn808427search22turn808427search37turn614097search7turn768854search0turn597525search0
+
+For a payment-terminal interpretation, the integration should begin from the vendor’s certified surface rather than from raw USB/Bluetooth. Stripe Terminal exposes SDK-driven reader control and pre-certified readers; Adyen exposes its Terminal API with local and cloud architectures; Square’s Mobile Payments SDK manages pairing, reader state and payment operations; Handpoint exposes dedicated Android SDK paths for supported PAX/Telpo/HiLite hardware. citeturn207997search0turn825946search7turn825946search6turn785603search10
+
+The key architectural conclusion is therefore conditional but clear: if AVF means Android Virtualization Framework, use privileged AVF APIs and a purpose-built Binder/vsock service; if AVF means a payment terminal, identify the exact vendor/model and use its supported SDK or Terminal API; if it is merely a generic serial/Bluetooth appliance, isolate the transport behind a terminal adapter and obtain the manufacturer’s command specification before writing control logic. This approach preserves the Android application architecture while the acronym ambiguity is resolved and minimizes both security and certification risk.

@@ -8,14 +8,18 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -48,6 +52,10 @@ fun SettingsScreen() {
     var geminiKey    by remember { mutableStateOf(prefs.getString(KEY_GEMINI_KEY, "") ?: "") }
     var desktopHost  by remember { mutableStateOf(prefs.getString(KEY_DESKTOP_HOST, "") ?: "") }
     var geminiKeyVisible by remember { mutableStateOf(false) }
+
+    // ── Linux Environment Probed Binaries ───────────────────────────────────
+    val probedBinaries by LinuxEnvironmentService.installedBinaries.collectAsState()
+    val isProbingBinaries by LinuxEnvironmentService.isProbingBinaries.collectAsState()
 
     // ── Scan parameters ────────────────────────────────────────────────────
     var scanIntervalMs by remember {
@@ -382,6 +390,98 @@ fun SettingsScreen() {
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                 )
+
+                // AVF / Linux Binaries Probe Section
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_avf_binaries_card"),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    "Guest Security Binaries",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    "Probes kismet, tcpdump, tshark & tools in guest VM",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        LinuxEnvironmentService.probeInstalledBinaries(context)
+                                        snackbarHostState.showSnackbar("Probed AVF guest binaries")
+                                    }
+                                },
+                                enabled = !isProbingBinaries,
+                                modifier = Modifier.testTag("settings_probe_binaries_btn")
+                            ) {
+                                if (isProbingBinaries) {
+                                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Probing...")
+                                } else {
+                                    Text("Probe")
+                                }
+                            }
+                        }
+
+                        if (probedBinaries.isNotEmpty()) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                probedBinaries.take(6).forEach { bin ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 2.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column {
+                                            Text(
+                                                bin.binary,
+                                                fontWeight = FontWeight.Bold,
+                                                fontFamily = FontFamily.Monospace,
+                                                style = MaterialTheme.typography.bodySmall
+                                            )
+                                            if (bin.isInstalled && !bin.version.isNullOrBlank()) {
+                                                Text(
+                                                    bin.version,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFF2E7D32),
+                                                    fontFamily = FontFamily.Monospace
+                                                )
+                                            }
+                                        }
+                                        Text(
+                                            if (bin.isInstalled) "✓ Installed" else "✗ Missing",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = if (bin.isInstalled) Color(0xFF2E7D32) else MaterialTheme.colorScheme.outline
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             HorizontalDivider()

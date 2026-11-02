@@ -60,13 +60,11 @@ jobs:
           cache: gradle
 
       - name: Grant Gradle execute permission
-        working-directory: android
         run: chmod +x gradlew
 
       # ── Step 1: Compile (catches syntax / import errors) ───────────────────
       - name: Compile sources
         id: compile
-        working-directory: android
         run: ./gradlew compileDebugKotlin --no-daemon 2>&1 | tee compile.log
         continue-on-error: true
 
@@ -75,13 +73,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-compile-log
-          path: android/compile.log
+          path: compile.log
           retention-days: 7
 
       # ── Step 2: Android Lint (XML report → annotations) ───────────────────
       - name: Android Lint
         id: lint
-        working-directory: android
         run: ./gradlew lintDebug --no-daemon 2>&1 | tee lint.log
         continue-on-error: true
 
@@ -91,8 +88,8 @@ jobs:
         with:
           name: android-lint-results
           path: |
-            android/app/build/reports/lint-results-debug.html
-            android/app/build/reports/lint-results-debug.xml
+            app/build/reports/lint-results-debug.html
+            app/build/reports/lint-results-debug.xml
           retention-days: 14
 
       # ── Step 3: ktlint (Kotlin code style) ────────────────────────────────
@@ -104,7 +101,6 @@ jobs:
 
       - name: Run ktlint
         id: ktlint
-        working-directory: android
         run: |
           ktlint --reporter=plain --reporter=checkstyle,output=build/ktlint-report.xml \
             "app/src/main/java/**/*.kt" \
@@ -117,13 +113,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-ktlint-report
-          path: android/build/ktlint-report.xml
+          path: build/ktlint-report.xml
           retention-days: 7
 
       # ── Step 4: Unit tests with coverage ──────────────────────────────────
       - name: Run unit tests
         id: tests
-        working-directory: android
         run: |
           ./gradlew test --no-daemon \
             -PtestCoverageEnabled=true \
@@ -136,14 +131,13 @@ jobs:
         with:
           name: android-test-results
           path: |
-            android/app/build/reports/tests/
-            android/app/build/test-results/
+            app/build/reports/tests/
+            app/build/test-results/
           retention-days: 14
 
       # ── Step 5: Debug APK build (final gate) ──────────────────────────────
       - name: Assemble debug APK
         id: apk_build
-        working-directory: android
         run: ./gradlew assembleDebug --no-daemon 2>&1 | tee apk-build.log
         continue-on-error: true
 
@@ -152,7 +146,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-debug-apk
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/*.apk
           retention-days: 14
 
       # ── Collect step outcomes for the summary ─────────────────────────────

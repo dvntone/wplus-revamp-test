@@ -105,4 +105,5 @@ dependencies {
     // Tests
     testImplementation(libs.junit)
     testImplementation(libs.mockk)
+    testImplementation(libs.json)
 }

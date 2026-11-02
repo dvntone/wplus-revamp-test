@@ -87,8 +87,11 @@ object PixelAvfDebianGuest {
             )
         }
 
-        // Test network reachability on guest port
-        val isReachable = testGuestSocket(host, port, timeoutMs = 1500)
+        // Test network reachability on requested port or default agent port
+        val requestedPortReachable = testGuestSocket(host, port, timeoutMs = 1500)
+        val agentPortReachable = if (port != DEFAULT_AGENT_PORT) testGuestSocket(host, DEFAULT_AGENT_PORT, timeoutMs = 1000) else requestedPortReachable
+        val isReachable = requestedPortReachable || agentPortReachable
+        val activePort = if (agentPortReachable) DEFAULT_AGENT_PORT else port
         val isRunning = isReachable || avfInfo.isTerminalAppInstalled
 
         if (!isReachable) {
@@ -105,7 +108,7 @@ object PixelAvfDebianGuest {
         }
 
         // Execute authenticated identity verification probe inside the guest
-        val identityResult = executeGuestCommand(context, "cat /etc/os-release && uname -r", host, port)
+        val identityResult = executeGuestCommand(context, "cat /etc/os-release && uname -r", host, activePort)
 
         val isDebian = identityResult.success &&
                 (identityResult.stdout.contains("ID=debian") ||
@@ -119,15 +122,17 @@ object PixelAvfDebianGuest {
 
         // Discover security tools inside the guest
         val tools = if (isDebian) {
-            discoverGuestTools(context, host, port)
+            discoverGuestTools(context, host, activePort)
         } else {
             emptyList()
         }
 
         val msg = if (isDebian) {
-            "Verified Debian Guest: $prettyName (Kernel: ${kernel ?: "Unknown"}, ${tools.size} tools detected)"
+            "Verified Debian Guest: $prettyName (Kernel: ${kernel ?: "Unknown"}, ${tools.size} tools detected via ${identityResult.executionChannel})"
+        } else if (identityResult.executionChannel == "SSH_PROTOCOL_CLIENT_REQUIRED") {
+            "OpenSSH service detected and reachable on $host:$port. VM is running. Launch the wscan+ AVF guest daemon on port $DEFAULT_AGENT_PORT or authorize Termux SSH for command execution."
         } else {
-            "Reachable on $host:$port, but guest OS failed Debian identity verification."
+            "Reachable on $host:$activePort, but guest OS failed Debian identity verification: ${identityResult.stderr ?: "Unknown"}"
         }
 
         AvfGuestState(
@@ -137,7 +142,7 @@ object PixelAvfDebianGuest {
             isReachable = true,
             isExecutionVerified = isDebian,
             guestHost = host,
-            guestPort = port,
+            guestPort = activePort,
             osPrettyName = prettyName,
             osId = osId,
             kernelRelease = kernel,
@@ -158,25 +163,87 @@ object PixelAvfDebianGuest {
         port: Int = DEFAULT_SSH_PORT,
         timeoutSeconds: Long = 15
     ): GuestExecutionResult = withContext(Dispatchers.IO) {
-        val socketReachable = testGuestSocket(host, port, timeoutMs = 1200)
+        // Resolve effective port: if port is 2222, but 8766 is open, use 8766 for direct agent execution
+        var targetPort = port
+        var isAgentPort = (targetPort == DEFAULT_AGENT_PORT)
 
-        // 1. Direct authenticated socket/SSH protocol to guest VM
+        if (targetPort == DEFAULT_SSH_PORT && testGuestSocket(host, DEFAULT_AGENT_PORT, timeoutMs = 800)) {
+            targetPort = DEFAULT_AGENT_PORT
+            isAgentPort = true
+        }
+
+        val socketReachable = testGuestSocket(host, targetPort, timeoutMs = 1200)
+
+        // 1. Direct authenticated socket to guest VM
         if (socketReachable) {
             try {
                 Socket().use { socket ->
-                    socket.connect(InetSocketAddress(host, port), 2000)
+                    socket.connect(InetSocketAddress(host, targetPort), 2000)
                     socket.soTimeout = (timeoutSeconds * 1000).toInt()
 
-                    val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                    val banner = reader.readLine() ?: ""
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+                    val writer = OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8)
 
-                    // If connected to OpenSSH or custom guest agent
-                    if (banner.startsWith("SSH-") || banner.contains("AVF-AGENT")) {
-                        Log.d(TAG, "Connected to guest service: $banner")
+                    // If target port is OpenSSH (starts with SSH-)
+                    if (!isAgentPort) {
+                        socket.soTimeout = 1500
+                        val banner = try { reader.readLine() ?: "" } catch (_: Exception) { "" }
+                        socket.soTimeout = (timeoutSeconds * 1000).toInt()
+
+                        if (banner.startsWith("SSH-")) {
+                            Log.d(TAG, "OpenSSH service banner detected on $targetPort: $banner")
+                            // Check if Termux SSH client is available
+                            val termuxStatus = TermuxBridge.getTermuxStatus(context)
+                            if (termuxStatus.isInstalled && termuxStatus.isPermissionGranted) {
+                                val escapedCmd = command.replace("\"", "\\\"")
+                                val sshCmd = "ssh -p $targetPort -o StrictHostKeyChecking=no -o BatchMode=yes $host \"$escapedCmd\""
+                                val termuxRes = TermuxBridge.executeCommand(context, sshCmd, timeoutSeconds = timeoutSeconds)
+                                return@withContext GuestExecutionResult(
+                                    success = termuxRes.success,
+                                    exitCode = termuxRes.exitCode,
+                                    stdout = termuxRes.stdout,
+                                    stderr = termuxRes.stderr,
+                                    verifiedDebianEnvironment = termuxRes.stdout.contains("Debian") ||
+                                            termuxRes.stdout.contains("microdroid") ||
+                                            termuxRes.success,
+                                    executionChannel = "TERMUX_SSH_TO_AVF"
+                                )
+                            } else {
+                                // Do NOT send plaintext EXEC to OpenSSH (which causes protocol mismatch)!
+                                return@withContext GuestExecutionResult(
+                                    success = false,
+                                    exitCode = -1,
+                                    stdout = "",
+                                    stderr = "OpenSSH daemon detected on $host:$targetPort ($banner). Direct plaintext socket commands cannot negotiate the SSH-2.0 protocol. Launch the wscan+ AVF guest daemon on port $DEFAULT_AGENT_PORT or authorize Termux SSH.",
+                                    verifiedDebianEnvironment = false,
+                                    executionChannel = "SSH_PROTOCOL_CLIENT_REQUIRED"
+                                )
+                            }
+                        }
+                    }
+
+                    // Authenticated AVF Guest Agent Protocol on DEFAULT_AGENT_PORT (8766) or custom agent port
+                    val authToken = AppPreferences.getOrCreateMcpAuthToken(context)
+                    writer.write("AUTH $authToken\n")
+                    writer.flush()
+
+                    // Optional handshake check from agent
+                    socket.soTimeout = 2000
+                    val handshakeLine = try { reader.readLine() } catch (_: Exception) { null }
+                    socket.soTimeout = (timeoutSeconds * 1000).toInt()
+
+                    if (handshakeLine != null && handshakeLine.startsWith("AUTH_FAILED")) {
+                        return@withContext GuestExecutionResult(
+                            success = false,
+                            exitCode = 401,
+                            stdout = "",
+                            stderr = "AVF Guest Daemon rejected authentication token: $handshakeLine",
+                            verifiedDebianEnvironment = false,
+                            executionChannel = "AVF_GUEST_AGENT"
+                        )
                     }
 
                     // Send command via authenticated protocol frame
-                    val writer = OutputStreamWriter(socket.getOutputStream())
                     writer.write("EXEC $command\n")
                     writer.flush()
 
@@ -198,11 +265,11 @@ object PixelAvfDebianGuest {
                         stdout = output.toString().trim(),
                         stderr = null,
                         verifiedDebianEnvironment = true,
-                        executionChannel = "AVF_GUEST_SOCKET"
+                        executionChannel = "AVF_GUEST_AGENT"
                     )
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Guest socket execution failed: ${e.message}")
+                Log.w(TAG, "Guest socket execution failed on port $targetPort: ${e.message}")
             }
         }
 
