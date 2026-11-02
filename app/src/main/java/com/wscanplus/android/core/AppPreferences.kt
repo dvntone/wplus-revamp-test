@@ -121,14 +121,19 @@ object AppPreferences {
      * Generates a cryptographically strong 32-character hex token on first access.
      */
     fun getOrCreateMcpAuthToken(context: Context): String {
-        val prefs = main(context)
-        val existing = prefs.getString(KEY_MCP_AUTH_TOKEN, null)
-        if (!existing.isNullOrBlank()) return existing
+        val existingSecure = getSecureSecret(context, KEY_MCP_AUTH_TOKEN, "")
+        if (existingSecure.isNotBlank()) return existingSecure
+
+        val legacy = main(context).getString(KEY_MCP_AUTH_TOKEN, null)
+        if (!legacy.isNullOrBlank()) {
+            setSecureSecret(context, KEY_MCP_AUTH_TOKEN, legacy)
+            return legacy
+        }
 
         val randomBytes = ByteArray(16)
         java.security.SecureRandom().nextBytes(randomBytes)
         val newToken = randomBytes.joinToString("") { "%02x".format(it) }
-        prefs.edit().putString(KEY_MCP_AUTH_TOKEN, newToken).apply()
+        setSecureSecret(context, KEY_MCP_AUTH_TOKEN, newToken)
         return newToken
     }
 
@@ -138,6 +143,7 @@ object AppPreferences {
     private const val CIPHER_AES_GCM = "AES/GCM/NoPadding"
     private const val GCM_TAG_LENGTH = 128
     private const val ENC_PREFIX = "enc:v1:"
+    private var jvmTestKey: java.security.Key? = null
 
     /**
      * Stores sensitive API keys with AES-256-GCM encryption backed by AndroidKeyStore.
@@ -198,7 +204,8 @@ object AppPreferences {
         }
     }
 
-    private fun getOrCreateKey(): java.security.Key {
+    @Synchronized
+    private fun getOrCreateKey(context: Context): java.security.Key {
         return try {
             val keyStore = java.security.KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
             if (!keyStore.containsAlias(KEY_ALIAS)) {
@@ -219,28 +226,27 @@ object AppPreferences {
             }
             keyStore.getKey(KEY_ALIAS, null)
         } catch (_: Exception) {
-            // JVM / unit test environment fallback: derive consistent software AES key
-            val salt = "wscanplus_master_keystore_fallback_salt_32bytes!!".toByteArray(Charsets.UTF_8)
-            val keyBytes = java.util.Arrays.copyOf(salt, 32)
-            javax.crypto.spec.SecretKeySpec(keyBytes, "AES")
+            // JVM unit test environment fallback: create or reuse in-memory AES-256 key
+            jvmTestKey ?: run {
+                val keyGen = javax.crypto.KeyGenerator.getInstance("AES")
+                keyGen.init(256, java.security.SecureRandom())
+                val k = keyGen.generateKey()
+                jvmTestKey = k
+                k
+            }
         }
     }
 
     private fun encryptString(context: Context, plainText: String): String {
-        return try {
-            val key = getOrCreateKey()
-            val cipher = javax.crypto.Cipher.getInstance(CIPHER_AES_GCM)
-            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key)
-            val iv = cipher.iv
-            val cipherBytes = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
+        val key = getOrCreateKey(context)
+        val cipher = javax.crypto.Cipher.getInstance(CIPHER_AES_GCM)
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key)
+        val iv = cipher.iv
+        val cipherBytes = cipher.doFinal(plainText.toByteArray(Charsets.UTF_8))
 
-            val ivB64 = b64Encode(iv)
-            val encB64 = b64Encode(cipherBytes)
-            "$ENC_PREFIX$ivB64:$encB64"
-        } catch (e: Exception) {
-            android.util.Log.w("AppPreferences", "KeyStore encryption failed, falling back to Base64: ${e.message}")
-            b64Encode(plainText.toByteArray(Charsets.UTF_8))
-        }
+        val ivB64 = b64Encode(iv)
+        val encB64 = b64Encode(cipherBytes)
+        return "$ENC_PREFIX$ivB64:$encB64"
     }
 
     private fun decryptString(context: Context, payload: String): String? {
@@ -250,7 +256,7 @@ object AppPreferences {
             val iv = b64Decode(parts[0])
             val cipherBytes = b64Decode(parts[1])
 
-            val key = getOrCreateKey()
+            val key = getOrCreateKey(context)
             val cipher = javax.crypto.Cipher.getInstance(CIPHER_AES_GCM)
             val spec = javax.crypto.spec.GCMParameterSpec(GCM_TAG_LENGTH, iv)
             cipher.init(javax.crypto.Cipher.DECRYPT_MODE, key, spec)

@@ -467,6 +467,20 @@ object LinuxEnvironmentService {
         }
 
         try {
+            val toolNameRegex = Regex("""^[a-zA-Z0-9_\-\.]+$""")
+            val pathRegex = Regex("""^/[a-zA-Z0-9_\-\./]+$""")
+
+            for (tool in tools) {
+                require(toolNameRegex.matches(tool)) {
+                    "Prohibited tool identifier contains invalid characters: $tool"
+                }
+            }
+            for (dir in searchPaths) {
+                require(pathRegex.matches(dir) && !dir.contains("..")) {
+                    "Prohibited search path contains invalid characters or traversal: $dir"
+                }
+            }
+
             val toolsArg = tools.joinToString(" ")
             val dirsArg = searchPaths.joinToString(" ")
             val scanCmd = "for bin in $toolsArg; do for dir in $dirsArg; do if [ -x \"\$dir/\$bin\" ]; then echo \"FOUND:\$bin:\$dir/\$bin\"; break; fi; done; done"
@@ -483,6 +497,10 @@ object LinuxEnvironmentService {
                     verifiedDebianEnvironment = false,
                     executionChannel = tRes.executionChannel
                 )
+            }
+
+            if (isAvf && !scanRes.verifiedDebianEnvironment) {
+                Log.w(TAG, "probeGuestTools: Execution channel is not verified Debian environment: ${scanRes.executionChannel}")
             }
 
             if (!scanRes.success && scanRes.stdout.isBlank()) {
@@ -741,9 +759,24 @@ object LinuxEnvironmentService {
         }
         val rawCmd = if (fullArgString.isNotBlank()) "$baseBinary $fullArgString" else baseBinary
 
-        // 4. Wrap command inside sandbox directory with mkdir guard
+        // 4. Validate working directory against directory traversal and metacharacters
+        val pathRegex = Regex("""^/[a-zA-Z0-9_\-\./]+$""")
+        if (!pathRegex.matches(request.workingDirectory) || request.workingDirectory.contains("..")) {
+            return@withContext ToolOrchestrationResult(
+                success = false,
+                exitCode = 400,
+                stdout = "",
+                stderr = "Path validation error: working directory '${request.workingDirectory}' contains prohibited characters or path traversal.",
+                executionChannel = "PATH_VALIDATOR",
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = false
+            )
+        }
+        val safeWorkDir = validateAndEscapeArgument(request.workingDirectory)
+
+        // Wrap command inside sandbox directory with mkdir guard
         val sandboxedCommand = buildString {
-            append("mkdir -p ${request.workingDirectory} && cd ${request.workingDirectory} && ")
+            append("mkdir -p $safeWorkDir && cd $safeWorkDir && ")
             if (request.requiresSudo) append("sudo ")
             append(rawCmd)
         }
@@ -803,7 +836,8 @@ object LinuxEnvironmentService {
     // ── Tool Session Management ───────────────────────────────────────────────
 
     /**
-     * Start a named background tool session (e.g. Kismet capture daemon, tcpdump logger).
+     * Start a named background tool session with proven session PID tracking.
+     * Callers must provide an explicit authorization token; local fallback is prohibited.
      */
     suspend fun startToolSession(
         context: Context,
@@ -813,21 +847,54 @@ object LinuxEnvironmentService {
         authToken: String? = null
     ): ToolSession = withContext(Dispatchers.IO) {
         val sessionId = UUID.randomUUID().toString().take(8)
-        val token = authToken ?: AppPreferences.getOrCreateMcpAuthToken(context)
+
+        // Strict authorization check: caller must explicitly supply the token
+        val expectedToken = AppPreferences.getOrCreateMcpAuthToken(context)
+        if (authToken.isNullOrBlank() || authToken != expectedToken) {
+            Log.w(TAG, "Unauthorized startToolSession invocation attempt for session '$sessionName'")
+            return@withContext ToolSession(
+                sessionId = sessionId,
+                toolId = toolId,
+                sessionName = sessionName,
+                pid = null,
+                startTimeMs = System.currentTimeMillis(),
+                executionChannel = "AUTH_GATE",
+                isRunning = false
+            )
+        }
+
+        // Orchestrate background process execution
+        val pidFile = "$SANDBOX_WORKING_DIR/session_${sessionId}.pid"
         val req = ToolOrchestrationRequest(
             toolId = toolId,
             arguments = arguments,
             requiresSudo = true,
             timeoutSeconds = 15,
-            authToken = token
+            authToken = authToken
         )
 
         val res = orchestrateTool(context, req)
+
+        // Probe guest for the verified process PID matching this tool
+        var verifiedPid: Int? = null
+        if (res.success) {
+            val pidQuery = ToolOrchestrationRequest(
+                toolId = "ps",
+                arguments = listOf("-C", toolId, "-o", "pid="),
+                authToken = authToken,
+                timeoutSeconds = 5
+            )
+            val pidRes = orchestrateTool(context, pidQuery)
+            if (pidRes.success && pidRes.stdout.isNotBlank()) {
+                verifiedPid = pidRes.stdout.trim().lines().lastOrNull()?.trim()?.toIntOrNull()
+            }
+        }
+
         val session = ToolSession(
             sessionId = sessionId,
             toolId = toolId,
             sessionName = sessionName,
-            pid = null,
+            pid = verifiedPid,
             startTimeMs = System.currentTimeMillis(),
             executionChannel = res.executionChannel,
             isRunning = res.success
@@ -837,24 +904,38 @@ object LinuxEnvironmentService {
     }
 
     /**
-     * Stop a running background tool session.
-     * Uses allowlisted pkill with signal termination and validates backend process exit status.
+     * Stop a running background tool session using targeted PID termination.
+     * Prevents system-wide pkill and requires explicit caller authorization.
      */
     suspend fun stopToolSession(context: Context, sessionId: String, authToken: String? = null): Boolean =
         withContext(Dispatchers.IO) {
             val session = activeSessions[sessionId] ?: return@withContext false
-            val token = authToken ?: AppPreferences.getOrCreateMcpAuthToken(context)
-            val killReq = ToolOrchestrationRequest(
-                toolId = "pkill",
-                arguments = listOf("-TERM", "-f", session.toolId),
-                requiresSudo = true,
-                timeoutSeconds = 5,
-                authToken = token
-            )
-            // Execute allowlisted signal termination
+
+            val expectedToken = AppPreferences.getOrCreateMcpAuthToken(context)
+            if (authToken.isNullOrBlank() || authToken != expectedToken) {
+                Log.w(TAG, "Unauthorized stopToolSession invocation attempt for session $sessionId")
+                return@withContext false
+            }
+
+            // Target the verified session PID specifically rather than global process name
+            val targetPid = session.pid
+            val killReq = if (targetPid != null) {
+                ToolOrchestrationRequest(
+                    toolId = "kill",
+                    arguments = listOf("-TERM", targetPid.toString()),
+                    requiresSudo = true,
+                    timeoutSeconds = 5,
+                    authToken = authToken
+                )
+            } else {
+                Log.w(TAG, "Session $sessionId has no verified PID; aborting termination to prevent killing unrelated processes.")
+                session.isRunning = false
+                activeSessions.remove(sessionId)
+                return@withContext false
+            }
+
             val res = orchestrateTool(context, killReq)
             if (res.success || res.exitCode == 0 || res.exitCode == 1) {
-                // Exit code 0 (matched and terminated) or 1 (already terminated)
                 session.isRunning = false
                 activeSessions.remove(sessionId)
                 true

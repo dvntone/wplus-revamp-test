@@ -27,6 +27,7 @@ import com.wscanplus.android.core.AppPreferences
 import com.wscanplus.android.core.IntegrationsManager
 import com.wscanplus.android.core.LinuxEnvironmentService
 import com.wscanplus.android.core.PixelAvfDebianGuest
+import com.wscanplus.android.core.TailscaleDetector
 import com.wscanplus.android.core.TermuxBridge
 import kotlinx.coroutines.launch
 import rikka.shizuku.Shizuku
@@ -53,6 +54,8 @@ fun IntegrationsScreen() {
     var adbInfo by remember { mutableStateOf(IntegrationsManager.getAdbInfo(context)) }
     var termuxStatus by remember { mutableStateOf(TermuxBridge.TermuxStatus()) }
     var avfGuestState by remember { mutableStateOf(PixelAvfDebianGuest.AvfGuestState()) }
+    var tailscaleStatus by remember { mutableStateOf(TailscaleDetector.detect(context)) }
+    var allowRemoteMcp by remember { mutableStateOf(AppPreferences.isMcpAllowRemoteEnabled(context)) }
 
     // AVF Debian Probed Binaries State
     val probedBinaries by LinuxEnvironmentService.installedBinaries.collectAsState()
@@ -76,6 +79,8 @@ fun IntegrationsScreen() {
         adbInfo = IntegrationsManager.getAdbInfo(context)
         isMcpRunning = mcpServer.isServerRunning()
         localIp = AgentMcpServer.getLocalIpAddress()
+        tailscaleStatus = TailscaleDetector.detect(context)
+        allowRemoteMcp = AppPreferences.isMcpAllowRemoteEnabled(context)
         scope.launch {
             termuxStatus = TermuxBridge.getTermuxStatus(context)
         }
@@ -686,6 +691,7 @@ fun IntegrationsScreen() {
 
                     1 -> {
                         // ── Tab 1: AI Agent & MCP Bridge ─────────────────────────
+                        // ── Tab 1: AI Agent & MCP Bridge ─────────────────────────
                         Card(
                             modifier = Modifier.fillMaxWidth(),
                             colors = CardDefaults.cardColors(
@@ -722,7 +728,11 @@ fun IntegrationsScreen() {
                                                 fontWeight = FontWeight.Bold
                                             )
                                             Text(
-                                                text = if (isMcpRunning) "Active on port ${mcpServer.port}" else "Server Inactive",
+                                                text = if (isMcpRunning) {
+                                                    "Active on port ${mcpServer.port} (${if (mcpServer.isRemoteModeActive) "Tailscale + Loopback" else "Loopback Only"})"
+                                                } else {
+                                                    "Server Inactive"
+                                                },
                                                 style = MaterialTheme.typography.bodySmall
                                             )
                                         }
@@ -735,12 +745,13 @@ fun IntegrationsScreen() {
                                                 isMcpRunning = false
                                                 scope.launch { snackbarHostState.showSnackbar("MCP Server stopped") }
                                             } else {
-                                                val started = mcpServer.start()
+                                                val started = mcpServer.start(allowRemote = allowRemoteMcp)
                                                 isMcpRunning = started
                                                 if (started) {
                                                     scope.launch { snackbarHostState.showSnackbar("MCP Server listening on port ${mcpServer.port}") }
                                                 } else {
-                                                    scope.launch { snackbarHostState.showSnackbar("Failed to bind port ${mcpServer.port}") }
+                                                    val err = mcpServer.lastError ?: "Failed to bind port ${mcpServer.port}"
+                                                    scope.launch { snackbarHostState.showSnackbar(err) }
                                                 }
                                             }
                                         },
@@ -753,40 +764,126 @@ fun IntegrationsScreen() {
                                     }
                                 }
 
+                                if (mcpServer.lastError != null) {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.errorContainer,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                                            Text(
+                                                text = mcpServer.lastError ?: "Server error",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onErrorContainer
+                                            )
+                                        }
+                                    }
+                                }
+
                                 HorizontalDivider()
 
-                                Text(
-                                    text = "Allows CLI AI agents (Claude Code, Gemini CLI, Cursor, GlassHaven / SSH Haven terminal) to execute AVF commands, inspect real-time threat captures, and trigger security audits over local network or localhost.",
-                                    style = MaterialTheme.typography.bodySmall
-                                )
+                                // 7 Independent Connection States
+                                Text("Independent Connection States:", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .horizontalScroll(rememberScrollState()),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    StateChip("Local MCP", isMcpRunning)
+                                    StateChip("Tailnet Connected", tailscaleStatus.isConnected && tailscaleStatus.tailscaleIpv4 != null)
+                                    StateChip("Remote Enabled", allowRemoteMcp)
+                                    StateChip("Remote Reachable", isMcpRunning && mcpServer.isRemoteModeActive)
+                                    StateChip("Client Authenticated", mcpServer.lastAuthenticatedClient != null)
+                                    StateChip("Debian Available", avfGuestState.isReachable)
+                                    StateChip("Debian Verified", avfGuestState.isExecutionVerified)
+                                }
 
+                                HorizontalDivider()
+
+                                // Remote Tailscale Policy Switch
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Allow Tailscale Remote Connections", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+                                        Text(
+                                            text = if (allowRemoteMcp) {
+                                                "Exposing to Tailnet clients (100.64.0.0/10). WAN and untrusted LAN are blocked."
+                                            } else {
+                                                "Restricted to local loopback (127.0.0.1) only."
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Switch(
+                                        checked = allowRemoteMcp,
+                                        onCheckedChange = { enable ->
+                                            allowRemoteMcp = enable
+                                            AppPreferences.main(context).edit().putBoolean(AppPreferences.KEY_MCP_ALLOW_REMOTE, enable).apply()
+                                            if (isMcpRunning) {
+                                                mcpServer.start(allowRemote = enable)
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("mcp_remote_switch")
+                                    )
+                                }
+
+                                // Active Endpoints Display
                                 Surface(
                                     shape = RoundedCornerShape(8.dp),
                                     color = MaterialTheme.colorScheme.surface,
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Column(modifier = Modifier.padding(12.dp)) {
-                                        Text("Connection Endpoints (Zero-Trust Loopback):", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                                        Text("• Host Bridge: adb forward tcp:${mcpServer.port} tcp:${mcpServer.port}", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                                        Text("• MCP Protocol: http://127.0.0.1:${mcpServer.port}/mcp", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                                        Text("• Terminal REST: http://127.0.0.1:${mcpServer.port}/api/terminal", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        val tailscaleIp = tailscaleStatus.tailscaleIpv4
+                                        val effectiveEndpoint = AgentMcpServer.getEffectiveEndpoint(context, mcpServer.port)
+
+                                        Text("Connection Endpoints:", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+
+                                        if (allowRemoteMcp && tailscaleIp != null) {
+                                            Text("• Tailnet MCP URL: http://$tailscaleIp:${mcpServer.port}/mcp", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                            Text("• Tailnet Terminal: http://$tailscaleIp:${mcpServer.port}/api/terminal", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                        }
+
+                                        Text("• Localhost MCP: http://127.0.0.1:${mcpServer.port}/mcp", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                        Text("• Host Bridge: adb forward tcp:${mcpServer.port} tcp:${mcpServer.port}", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.secondary)
                                         Text("• Threat Logs: http://127.0.0.1:${mcpServer.port}/api/threats", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                                        Text("• System Status: http://127.0.0.1:${mcpServer.port}/status", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+
+                                        if (mcpServer.lastAuthenticatedClient != null) {
+                                            Text("• Last Authenticated Client: ${mcpServer.lastAuthenticatedClient}", fontFamily = FontFamily.Monospace, fontSize = 11.sp, color = Color(0xFF2E7D32))
+                                        }
                                     }
                                 }
 
+                                // Copy Config Buttons
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
+                                    val token = AppPreferences.getOrCreateMcpAuthToken(context)
+                                    val tailscaleIp = tailscaleStatus.tailscaleIpv4
+
                                     OutlinedButton(
                                         onClick = {
-                                            val token = AppPreferences.getOrCreateMcpAuthToken(context)
+                                            val endpoint = if (allowRemoteMcp && tailscaleIp != null) {
+                                                "http://$tailscaleIp:${mcpServer.port}/mcp"
+                                            } else {
+                                                "http://127.0.0.1:${mcpServer.port}/mcp"
+                                            }
                                             val configJson = """
 {
   "mcpServers": {
     "wscanplus-avf": {
-      "url": "http://127.0.0.1:${mcpServer.port}/mcp",
+      "url": "$endpoint",
       "headers": {
         "Authorization": "Bearer $token"
       }
@@ -795,26 +892,26 @@ fun IntegrationsScreen() {
 }
                                             """.trimIndent()
                                             clipboardManager.setText(AnnotatedString(configJson))
-                                            scope.launch { snackbarHostState.showSnackbar("Copied MCP config with auth token") }
+                                            scope.launch { snackbarHostState.showSnackbar("Copied MCP config ($endpoint)") }
                                         },
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("Copy MCP Config")
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(if (allowRemoteMcp && tailscaleIp != null) "Copy Tailnet MCP" else "Copy MCP Config")
                                     }
 
                                     OutlinedButton(
                                         onClick = {
-                                            val token = AppPreferences.getOrCreateMcpAuthToken(context)
-                                            val curlCmd = "curl -X POST http://127.0.0.1:${mcpServer.port}/api/terminal -H \"Authorization: Bearer $token\" -H \"Content-Type: application/json\" -d '{\"command\": \"uname -a\"}'"
+                                            val hostStr = if (allowRemoteMcp && tailscaleIp != null) tailscaleIp else "127.0.0.1"
+                                            val curlCmd = "curl -X POST http://$hostStr:${mcpServer.port}/api/terminal -H \"Authorization: Bearer $token\" -H \"Content-Type: application/json\" -d '{\"command\": \"uname -a\"}'"
                                             clipboardManager.setText(AnnotatedString(curlCmd))
                                             scope.launch { snackbarHostState.showSnackbar("Copied authenticated CLI command") }
                                         },
                                         modifier = Modifier.weight(1f)
                                     ) {
                                         Icon(Icons.Filled.Code, contentDescription = null, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(6.dp))
+                                        Spacer(Modifier.width(4.dp))
                                         Text("Copy CLI Command")
                                     }
                                 }

@@ -50,6 +50,16 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
         private set
     var lastQuerySummary: String = "No requests yet"
         private set
+    var lastError: String? = null
+        private set
+    var lastAuthenticatedClient: String? = null
+        private set
+    var lastAuthenticatedTimestamp: Long = 0L
+        private set
+    var isRemoteModeActive: Boolean = false
+        private set
+    var activeBoundAddress: String = "127.0.0.1"
+        private set
 
     val agentActivities = kotlinx.coroutines.flow.MutableStateFlow<List<McpAgentActivity>>(
         emptyList()
@@ -70,18 +80,27 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
 
     /**
      * Start the on-device MCP / REST bridge server.
-     * Defaults to loopback 127.0.0.1 for zero-trust local security.
+     * When [allowRemote] is false (default), binds strictly to loopback 127.0.0.1.
+     * When [allowRemote] is true, binds to 0.0.0.0 while enforcing Tailscale CGNAT IP allowlist filtering.
      */
-    fun start(): Boolean {
-        if (isRunning.get()) return true
+    fun start(allowRemote: Boolean = AppPreferences.isMcpAllowRemoteEnabled(context)): Boolean {
+        if (isRunning.get()) {
+            if (isRemoteModeActive == allowRemote) return true
+            stop()
+        }
+
+        lastError = null
         return try {
-            val bindHost = "127.0.0.1"
+            val bindHost = if (allowRemote) "0.0.0.0" else "127.0.0.1"
             val socket = ServerSocket(port, 50, InetAddress.getByName(bindHost))
             serverSocket = socket
             isRunning.set(true)
+            isRemoteModeActive = allowRemote
+            activeBoundAddress = bindHost
 
             serverJob = scope.launch {
-                Log.i(TAG, "Agent MCP Server listening strictly on loopback $bindHost:$port")
+                val modeLabel = if (allowRemote) "Tailscale + Loopback ($bindHost:$port)" else "Strict Loopback (127.0.0.1:$port)"
+                Log.i(TAG, "Agent MCP Server listening on $modeLabel")
                 while (isActive && isRunning.get()) {
                     try {
                         val client = socket.accept()
@@ -95,15 +114,23 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
                 }
             }
             true
+        } catch (e: java.net.BindException) {
+            val msg = "Port conflict: Port $port is already bound by another service."
+            Log.e(TAG, msg, e)
+            lastError = msg
+            isRunning.set(false)
+            false
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start Agent MCP Server on port $port", e)
+            val msg = "Failed to start Agent MCP Server on port $port: ${e.message}"
+            Log.e(TAG, msg, e)
+            lastError = msg
             isRunning.set(false)
             false
         }
     }
 
     /**
-     * Stop the server.
+     * Stop the server and release sockets and coroutines.
      */
     fun stop() {
         isRunning.set(false)
@@ -130,15 +157,16 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
     }
 
     /**
-     * Handle incoming HTTP / MCP request with zero-trust token authentication and loopback enforcement.
+     * Handle incoming HTTP / MCP request with zero-trust token authentication and Tailscale / loopback enforcement.
      */
     private suspend fun handleClient(client: Socket) = withContext(Dispatchers.IO) {
         var clientOrigin: String? = null
         try {
-            // Enforce loopback-only client origin
+            // Enforce Tailscale and loopback network boundary
             val remoteAddr = client.inetAddress
-            if (!remoteAddr.isLoopbackAddress && remoteAddr.hostAddress != "127.0.0.1" && remoteAddr.hostAddress != "::1") {
-                Log.w(TAG, "Rejected non-loopback connection attempt from ${remoteAddr.hostAddress}")
+            val allowRemote = isRemoteModeActive || AppPreferences.isMcpAllowRemoteEnabled(context)
+            if (!TailscaleDetector.isAuthorizedClientAddress(remoteAddr, allowRemote)) {
+                Log.w(TAG, "Rejected unauthorized origin connection attempt from ${remoteAddr.hostAddress} (remoteAllowed=$allowRemote)")
                 client.close()
                 return@withContext
             }
@@ -214,15 +242,23 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
             val candidateToken = authHeader.ifBlank { queryToken ?: "" }.ifBlank { bodyToken ?: "" }
 
             val isAuthorized = validateToken(candidateToken)
+            if (isAuthorized) {
+                lastAuthenticatedClient = remoteAddr.hostAddress
+                lastAuthenticatedTimestamp = System.currentTimeMillis()
+            }
 
             when {
                 // Public Health Check
                 path == "/health" && method == "GET" -> {
                     lastQuerySummary = "REST: /health"
+                    val tailscale = TailscaleDetector.detect(context)
                     val resp = JSONObject().apply {
                         put("status", "UP")
-                        put("loopbackOnly", true)
-                        put("bindAddress", "127.0.0.1")
+                        put("loopbackOnly", !isRemoteModeActive)
+                        put("bindAddress", activeBoundAddress)
+                        put("remoteModeActive", isRemoteModeActive)
+                        put("tailscaleConnected", tailscale.isConnected)
+                        put("tailscaleIp", tailscale.tailscaleIpv4)
                         put("authRequired", true)
                     }
                     sendResponse(out, 200, "OK", "application/json", resp.toString(), clientOrigin)
@@ -235,13 +271,25 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
                     val shizuku = IntegrationsManager.getShizukuStatus(context)
                     val root = IntegrationsManager.getRootInfo(context)
                     val adb = IntegrationsManager.getAdbInfo(context)
+                    val tailscale = TailscaleDetector.detect(context)
 
                     val resp = JSONObject().apply {
                         put("app", "wscan+")
                         put("version", "1.0.0")
-                        put("loopbackOnly", true)
-                        put("bindAddress", "127.0.0.1")
+                        put("loopbackOnly", !isRemoteModeActive)
+                        put("bindAddress", activeBoundAddress)
+                        put("remoteModeActive", isRemoteModeActive)
+                        put("tailscale", JSONObject().apply {
+                            put("installed", tailscale.isInstalled)
+                            put("vpnActive", tailscale.isVpnActive)
+                            put("connected", tailscale.isConnected)
+                            put("ipv4", tailscale.tailscaleIpv4)
+                            put("ipv6", tailscale.tailscaleIpv6)
+                            put("interface", tailscale.interfaceName)
+                            put("statusMessage", tailscale.statusMessage)
+                        })
                         put("authRequired", true)
+                        put("lastAuthenticatedClient", lastAuthenticatedClient ?: "none")
                         put("pixelAvf", JSONObject().apply {
                             put("isPixel", pixelAvf.isPixelDevice)
                             put("avfSupported", pixelAvf.isAvfSupported)
@@ -893,7 +941,13 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
         out.write("HTTP/1.1 $statusCode $statusText\r\n")
         out.write("Content-Type: $contentType; charset=utf-8\r\n")
         out.write("Content-Length: ${bytes.size}\r\n")
-        if (!requestOrigin.isNullOrBlank() && (requestOrigin.startsWith("http://localhost") || requestOrigin.startsWith("http://127.0.0.1") || requestOrigin.startsWith("https://localhost"))) {
+        val originAllowed = !requestOrigin.isNullOrBlank() && (
+            isRemoteModeActive ||
+            requestOrigin.startsWith("http://localhost") ||
+            requestOrigin.startsWith("http://127.0.0.1") ||
+            requestOrigin.startsWith("https://localhost")
+        )
+        if (originAllowed) {
             out.write("Access-Control-Allow-Origin: $requestOrigin\r\n")
         } else {
             out.write("Access-Control-Allow-Origin: http://127.0.0.1\r\n")
@@ -933,6 +987,32 @@ class AgentMcpServer(private val context: Context, val port: Int = 8080) {
                 Log.w(TAG, "Failed to resolve IP: ${e.message}")
             }
             return "127.0.0.1"
+        }
+
+        /**
+         * Returns the Tailscale endpoint URL if active, or null.
+         */
+        fun getTailscaleEndpointUrl(context: Context, port: Int = 8080): String? {
+            val ts = TailscaleDetector.detect(context)
+            val ip = ts.tailscaleIpv4 ?: return null
+            return "http://$ip:$port/mcp"
+        }
+
+        /**
+         * Returns the loopback endpoint URL.
+         */
+        fun getLocalEndpointUrl(port: Int = 8080): String = "http://127.0.0.1:$port/mcp"
+
+        /**
+         * Returns the effective MCP endpoint based on remote mode setting and Tailscale presence.
+         */
+        fun getEffectiveEndpoint(context: Context, port: Int = 8080): String {
+            val allowRemote = AppPreferences.isMcpAllowRemoteEnabled(context)
+            if (allowRemote) {
+                val tsUrl = getTailscaleEndpointUrl(context, port)
+                if (tsUrl != null) return tsUrl
+            }
+            return getLocalEndpointUrl(port)
         }
     }
 }

@@ -221,4 +221,78 @@ class AgentMcpServerTest {
         assertEquals("ok", activity.status)
         assertEquals("Real probe executed", activity.summary)
     }
+
+    @Test
+    fun `TailscaleDetector correctly identifies CGNAT 100 64 0 0 slash 10 address range`() {
+        val tsIp1 = java.net.InetAddress.getByName("100.64.0.1")
+        val tsIp2 = java.net.InetAddress.getByName("100.115.92.14")
+        val tsIp3 = java.net.InetAddress.getByName("100.127.255.254")
+
+        val lanIp = java.net.InetAddress.getByName("192.168.1.100")
+        val privateIp = java.net.InetAddress.getByName("10.0.0.5")
+        val wanIp = java.net.InetAddress.getByName("8.8.8.8")
+        val loopback = java.net.InetAddress.getByName("127.0.0.1")
+
+        assertTrue("100.64.0.1 must be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(tsIp1))
+        assertTrue("100.115.92.14 must be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(tsIp2))
+        assertTrue("100.127.255.254 must be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(tsIp3))
+
+        assertFalse("192.168.1.100 must not be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(lanIp))
+        assertFalse("10.0.0.5 must not be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(privateIp))
+        assertFalse("8.8.8.8 must not be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(wanIp))
+        assertFalse("127.0.0.1 must not be recognized as Tailscale", TailscaleDetector.isTailscaleIpv4(loopback))
+    }
+
+    @Test
+    fun `isAuthorizedClientAddress strictly enforces local versus remote access policies`() {
+        val loopback = java.net.InetAddress.getByName("127.0.0.1")
+        val tailscalePeer = java.net.InetAddress.getByName("100.80.45.12")
+        val lanUntrusted = java.net.InetAddress.getByName("192.168.1.55")
+        val wanUntrusted = java.net.InetAddress.getByName("142.250.190.46")
+
+        // In Local-Only Mode (allowRemote = false):
+        assertTrue("Loopback must always be authorized", TailscaleDetector.isAuthorizedClientAddress(loopback, allowRemote = false))
+        assertFalse("Tailscale peer must be blocked when remote mode is disabled", TailscaleDetector.isAuthorizedClientAddress(tailscalePeer, allowRemote = false))
+        assertFalse("LAN peer must be blocked in local-only mode", TailscaleDetector.isAuthorizedClientAddress(lanUntrusted, allowRemote = false))
+        assertFalse("WAN peer must be blocked in local-only mode", TailscaleDetector.isAuthorizedClientAddress(wanUntrusted, allowRemote = false))
+
+        // In Remote Tailscale Mode (allowRemote = true):
+        assertTrue("Loopback must remain authorized in remote mode", TailscaleDetector.isAuthorizedClientAddress(loopback, allowRemote = true))
+        assertTrue("Tailscale peer must be authorized in remote mode", TailscaleDetector.isAuthorizedClientAddress(tailscalePeer, allowRemote = true))
+        assertFalse("LAN peer must be rejected even when remote mode is enabled", TailscaleDetector.isAuthorizedClientAddress(lanUntrusted, allowRemote = true))
+        assertFalse("WAN peer must be rejected even when remote mode is enabled", TailscaleDetector.isAuthorizedClientAddress(wanUntrusted, allowRemote = true))
+    }
+
+    @Test
+    fun `read-only tools execute without requiring authentication token`() = runBlocking {
+        val req = JSONObject().apply {
+            put("jsonrpc", "2.0")
+            put("id", 10)
+            put("method", "tools/call")
+            put("params", JSONObject().apply {
+                put("name", "wscan_system_status")
+                put("arguments", JSONObject())
+            })
+        }.toString()
+
+        val respStr = server.handleMcpRequest(req, isRequestAuthorized = false)
+        val resp = JSONObject(respStr)
+        assertFalse("Read-only system status must not produce auth error", resp.has("error"))
+        assertTrue("Read-only system status must return result content", resp.has("result"))
+    }
+
+    @Test
+    fun `server start accurately tracks local and remote listener configurations`() {
+        try {
+            val localStarted = server.start(allowRemote = false)
+            if (localStarted) {
+                assertFalse("Remote mode must be inactive in local-only start", server.isRemoteModeActive)
+                assertEquals("127.0.0.1", server.activeBoundAddress)
+            }
+            server.stop()
+            assertFalse(server.isServerRunning())
+        } finally {
+            server.stop()
+        }
+    }
 }

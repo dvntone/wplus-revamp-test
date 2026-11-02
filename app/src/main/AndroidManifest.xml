@@ -50,6 +50,7 @@
     <!-- Package visibility declarations for external terminal and privileged toolchain environments -->
     <queries>
         <package android:name="com.termux" />
+        <package android:name="com.tailscale.ipn" />
         <package android:name="com.google.android.virtualmachine.terminal" />
         <package android:name="com.android.virtualmachine.terminal" />
         <package android:name="moe.shizuku.privileged.api" />
