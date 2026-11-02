@@ -49,7 +49,7 @@ fun SettingsScreen() {
     // ── Cloud / companion ──────────────────────────────────────────────────
     var firebaseUrl  by remember { mutableStateOf(prefs.getString(KEY_FIREBASE_URL, "") ?: "") }
     var deviceId     by remember { mutableStateOf(prefs.getString(KEY_DEVICE_ID, Build.MODEL) ?: Build.MODEL) }
-    var geminiKey    by remember { mutableStateOf(prefs.getString(KEY_GEMINI_KEY, "") ?: "") }
+    var geminiKey    by remember { mutableStateOf(AppPreferences.getSecureSecret(context, KEY_GEMINI_KEY)) }
     var desktopHost  by remember { mutableStateOf(prefs.getString(KEY_DESKTOP_HOST, "") ?: "") }
     var geminiKeyVisible by remember { mutableStateOf(false) }
 
@@ -119,7 +119,6 @@ fun SettingsScreen() {
         prefs.edit()
             .putString(KEY_FIREBASE_URL, firebaseUrl.trim())
             .putString(KEY_DEVICE_ID, deviceId.trim())
-            .putString(KEY_GEMINI_KEY, geminiKey.trim())
             .putString(KEY_DESKTOP_HOST, desktopHost.trim())
             .putLong(AppPreferences.KEY_SCAN_INTERVAL_MS,
                 scanIntervalMs.toLongOrNull() ?: AppPreferences.DEFAULT_SCAN_INTERVAL_MS)
@@ -128,6 +127,7 @@ fun SettingsScreen() {
             .putString(AppPreferences.KEY_PREFERRED_TERMINAL, selectedTerminalId)
             .putString(AppPreferences.KEY_LINUX_ENV_DISTRO, linuxEnvDistro.trim())
             .apply()
+        AppPreferences.setSecureSecret(context, KEY_GEMINI_KEY, geminiKey.trim())
         featurePrefs.edit()
             .putBoolean(AppPreferences.KEY_FEATURE_EVIL_TWIN, ftEvilTwin)
             .putBoolean(AppPreferences.KEY_FEATURE_DEAUTH_FLOOD, ftDeauthFlood)
@@ -624,7 +624,7 @@ fun Context.getWscanPref(key: String, default: String = ""): String =
     getSharedPreferences(AppPreferences.PREFS_MAIN, Context.MODE_PRIVATE)
         .getString(key, default) ?: default
 
-val Context.geminiApiKey: String   get() = getWscanPref(KEY_GEMINI_KEY)
+val Context.geminiApiKey: String   get() = AppPreferences.getSecureSecret(this, KEY_GEMINI_KEY)
 val Context.firebaseDatabaseUrl: String get() = getWscanPref(KEY_FIREBASE_URL)
 val Context.wscanDeviceId: String  get() = getWscanPref(KEY_DEVICE_ID, android.os.Build.MODEL)
 val Context.desktopHost: String    get() = getWscanPref(KEY_DESKTOP_HOST)

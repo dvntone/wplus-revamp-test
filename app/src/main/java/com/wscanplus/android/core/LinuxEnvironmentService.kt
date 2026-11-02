@@ -116,12 +116,13 @@ object LinuxEnvironmentService {
     private val activeSessions = ConcurrentHashMap<String, ToolSession>()
 
     // Whitelist of allowed security binaries for sandboxed execution
-    private val ALLOWED_SECURITY_BINARIES = setOf(
+    val ALLOWED_SECURITY_BINARIES = setOf(
         "kismet", "kismet_server", "tcpdump", "tshark", "wireshark",
         "aircrack-ng", "airmon-ng", "airodump-ng", "aireplay-ng", "airbase-ng",
         "iw", "iwconfig", "iwlist", "hcxdumptool", "hcxpcapngtool",
         "rtl_tcp", "rtl_433", "hackrf_info", "nmap", "suricata",
-        "uname", "which", "cat", "ps", "ls", "echo", "id", "uptime", "free"
+        "uname", "which", "cat", "ps", "ls", "echo", "id", "uptime", "free",
+        "kill", "pkill"
     )
 
     // ── Availability detection ────────────────────────────────────────────────
@@ -527,9 +528,9 @@ object LinuxEnvironmentService {
     ): ToolOrchestrationResult = withContext(Dispatchers.IO) {
         val startMs = System.currentTimeMillis()
 
-        // 1. Verify caller authentication if MCP authentication is required
-        val expectedToken = AppPreferences.main(context).getString(AppPreferences.KEY_MCP_AUTH_TOKEN, null)
-        if (!expectedToken.isNullOrBlank() && request.authToken != expectedToken) {
+        // 1. Verify caller authentication: mandatory authorization token (fail closed)
+        val expectedToken = AppPreferences.getOrCreateMcpAuthToken(context)
+        if (request.authToken.isNullOrBlank() || request.authToken != expectedToken) {
             Log.w(TAG, "Unauthorized tool orchestration attempt for tool '${request.toolId}'")
             return@withContext ToolOrchestrationResult(
                 success = false,
@@ -557,11 +558,21 @@ object LinuxEnvironmentService {
             )
         }
 
-        // 3. Sanitize arguments (prevent shell injection)
-        val sanitizedArgs = sanitizeArguments(request.arguments)
-        val subCmd = request.subCommand?.let { sanitizeArgument(it) } ?: ""
-
-        val fullArgString = listOfNotNull(subCmd.ifBlank { null }, sanitizedArgs.ifBlank { null }).joinToString(" ")
+        // 3. Sanitize and validate arguments vector against injection
+        val fullArgString = try {
+            buildValidatedArgumentString(request.subCommand, request.arguments)
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "Argument validation failure: ${e.message}")
+            return@withContext ToolOrchestrationResult(
+                success = false,
+                exitCode = 400,
+                stdout = "",
+                stderr = "Argument validation error: ${e.message}",
+                executionChannel = "ARGUMENT_VALIDATOR",
+                durationMs = System.currentTimeMillis() - startMs,
+                sandboxVerified = false
+            )
+        }
         val rawCmd = if (fullArgString.isNotBlank()) "$baseBinary $fullArgString" else baseBinary
 
         // 4. Wrap command inside sandbox directory with mkdir guard
@@ -636,12 +647,13 @@ object LinuxEnvironmentService {
         authToken: String? = null
     ): ToolSession = withContext(Dispatchers.IO) {
         val sessionId = UUID.randomUUID().toString().take(8)
+        val token = authToken ?: AppPreferences.getOrCreateMcpAuthToken(context)
         val req = ToolOrchestrationRequest(
             toolId = toolId,
             arguments = arguments,
             requiresSudo = true,
             timeoutSeconds = 15,
-            authToken = authToken
+            authToken = token
         )
 
         val res = orchestrateTool(context, req)
@@ -660,22 +672,30 @@ object LinuxEnvironmentService {
 
     /**
      * Stop a running background tool session.
+     * Uses allowlisted pkill with signal termination and validates backend process exit status.
      */
     suspend fun stopToolSession(context: Context, sessionId: String, authToken: String? = null): Boolean =
         withContext(Dispatchers.IO) {
             val session = activeSessions[sessionId] ?: return@withContext false
+            val token = authToken ?: AppPreferences.getOrCreateMcpAuthToken(context)
             val killReq = ToolOrchestrationRequest(
-                toolId = "killall",
-                arguments = listOf("-9", session.toolId),
+                toolId = "pkill",
+                arguments = listOf("-TERM", "-f", session.toolId),
                 requiresSudo = true,
                 timeoutSeconds = 5,
-                authToken = authToken
+                authToken = token
             )
-            // Execute kill via sandboxed runner or pkill
+            // Execute allowlisted signal termination
             val res = orchestrateTool(context, killReq)
-            session.isRunning = false
-            activeSessions.remove(sessionId)
-            res.success
+            if (res.success || res.exitCode == 0 || res.exitCode == 1) {
+                // Exit code 0 (matched and terminated) or 1 (already terminated)
+                session.isRunning = false
+                activeSessions.remove(sessionId)
+                true
+            } else {
+                Log.w(TAG, "Failed to terminate process for session $sessionId: ${res.stderr}")
+                false
+            }
         }
 
     fun getActiveSessions(): List<ToolSession> = activeSessions.values.toList()
@@ -770,13 +790,39 @@ object LinuxEnvironmentService {
 
     // ── Internal Helpers & Sanitizers ─────────────────────────────────────────
 
-    private fun sanitizeArgument(arg: String): String {
-        // Remove dangerous shell control tokens
-        return arg.replace(Regex("[;&|`$><!\\n\\r]"), "")
+    /**
+     * Validates and safely escapes an individual command-line argument.
+     * Enforces strict rejection of command chaining, subshell evaluation, and injection characters.
+     */
+    fun validateAndEscapeArgument(arg: String): String {
+        require(!arg.contains("\u0000") && !arg.contains("\n") && !arg.contains("\r")) {
+            "Argument contains prohibited newline or null character"
+        }
+        val dangerousPattern = Regex("""[;&|`$<>()\\]""")
+        if (dangerousPattern.containsMatchIn(arg)) {
+            throw IllegalArgumentException("Argument contains prohibited shell control characters: $arg")
+        }
+        return if (arg.contains(" ") || arg.contains("\t") || arg.isBlank()) {
+            "'" + arg.replace("'", "'\\''") + "'"
+        } else {
+            arg
+        }
     }
 
-    private fun sanitizeArguments(args: List<String>): String {
-        return args.joinToString(" ") { sanitizeArgument(it) }
+    /**
+     * Constructs a validated, injection-resistant command arguments string from an argument vector.
+     */
+    fun buildValidatedArgumentString(subCmd: String?, arguments: List<String>): String {
+        val validatedArgs = mutableListOf<String>()
+        if (!subCmd.isNullOrBlank()) {
+            validatedArgs.add(validateAndEscapeArgument(subCmd))
+        }
+        for (arg in arguments) {
+            if (arg.isNotBlank()) {
+                validatedArgs.add(validateAndEscapeArgument(arg))
+            }
+        }
+        return validatedArgs.joinToString(" ")
     }
 
     private fun testSocketReachable(host: String, port: Int, timeoutMs: Int): Boolean {

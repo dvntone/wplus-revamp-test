@@ -114,7 +114,7 @@ class AiProviderManager(private val context: Context) {
                 queryLocalRuleAgent(userMessage, recentLogs)
             }
             ProviderType.GEMINI -> {
-                val apiKey = prefs.getString(AppPreferences.KEY_GEMINI_KEY, "") ?: ""
+                val apiKey = AppPreferences.getSecureSecret(context, AppPreferences.KEY_GEMINI_KEY)
                 if (apiKey.isBlank()) {
                     queryLocalRuleAgent(userMessage, recentLogs)
                 } else {
@@ -209,8 +209,7 @@ class AiProviderManager(private val context: Context) {
     }
 
     private suspend fun evaluateGemini(logs: List<ThreatLog>, startMs: Long): AiAssessment {
-        val prefs = AppPreferences.main(context)
-        val apiKey = prefs.getString(AppPreferences.KEY_GEMINI_KEY, "") ?: ""
+        val apiKey = AppPreferences.getSecureSecret(context, AppPreferences.KEY_GEMINI_KEY)
         if (apiKey.isBlank()) {
             val local = evaluateLocalRules(logs, startMs)
             return local.copy(
@@ -283,7 +282,7 @@ class AiProviderManager(private val context: Context) {
             ?: AppPreferences.DEFAULT_OPENAI_BASE_URL
         val model = prefs.getString(AppPreferences.KEY_OPENAI_MODEL, AppPreferences.DEFAULT_OPENAI_MODEL)
             ?: AppPreferences.DEFAULT_OPENAI_MODEL
-        val apiKey = prefs.getString(AppPreferences.KEY_OPENAI_API_KEY, "") ?: ""
+        val apiKey = AppPreferences.getSecureSecret(context, AppPreferences.KEY_OPENAI_API_KEY)
 
         val prompt = buildThreatPrompt(logs)
         val response = tryOpenAiCall(baseUrl, apiKey, model, prompt)
@@ -348,7 +347,7 @@ class AiProviderManager(private val context: Context) {
             ?: AppPreferences.DEFAULT_OPENAI_BASE_URL
         val model = prefs.getString(AppPreferences.KEY_OPENAI_MODEL, AppPreferences.DEFAULT_OPENAI_MODEL)
             ?: AppPreferences.DEFAULT_OPENAI_MODEL
-        val apiKey = prefs.getString(AppPreferences.KEY_OPENAI_API_KEY, "") ?: ""
+        val apiKey = AppPreferences.getSecureSecret(context, AppPreferences.KEY_OPENAI_API_KEY)
 
         val prompt = "Context: $contextLog\nUser: $userMsg\nRespond as Nyx, the tactical wscan+ security mascot."
         return tryOpenAiCall(baseUrl, apiKey, model, prompt)

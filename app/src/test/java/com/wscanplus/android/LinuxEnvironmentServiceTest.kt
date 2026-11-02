@@ -172,4 +172,62 @@ class LinuxEnvironmentServiceTest {
         assertEquals(LinuxEnvironmentService.ToolCategory.PACKET_ANALYSIS, LinuxEnvironmentService.getBinaryCategory("tshark"))
         assertEquals(LinuxEnvironmentService.ToolCategory.SDR_RF, LinuxEnvironmentService.getBinaryCategory("rtl_tcp"))
     }
+
+    @Test
+    fun `ALLOWED_SECURITY_BINARIES contains required security tools and process signals`() {
+        val allowlist = LinuxEnvironmentService.ALLOWED_SECURITY_BINARIES
+        assertTrue(allowlist.contains("kismet"))
+        assertTrue(allowlist.contains("tcpdump"))
+        assertTrue(allowlist.contains("tshark"))
+        assertTrue(allowlist.contains("iw"))
+        assertTrue(allowlist.contains("aircrack-ng"))
+        assertTrue(allowlist.contains("kill"))
+        assertTrue(allowlist.contains("pkill"))
+
+        // Disallow dangerous or arbitrary binaries
+        assertFalse(allowlist.contains("nc"))
+        assertFalse(allowlist.contains("bash"))
+        assertFalse(allowlist.contains("sh"))
+        assertFalse(allowlist.contains("rm"))
+        assertFalse(allowlist.contains("chmod"))
+    }
+
+    @Test
+    fun `validateAndEscapeArgument allows valid safe arguments and wraps spaced arguments`() {
+        assertEquals("wlan0", LinuxEnvironmentService.validateAndEscapeArgument("wlan0"))
+        assertEquals("-i", LinuxEnvironmentService.validateAndEscapeArgument("-i"))
+        assertEquals("'My Network'", LinuxEnvironmentService.validateAndEscapeArgument("My Network"))
+    }
+
+    @Test
+    fun `validateAndEscapeArgument rejects prohibited shell injection characters`() {
+        val injectionPayloads = listOf(
+            "; rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "test | cat",
+            "out > /tmp/x",
+            "in < /tmp/x",
+            "arg1 & arg2"
+        )
+
+        for (payload in injectionPayloads) {
+            try {
+                LinuxEnvironmentService.validateAndEscapeArgument(payload)
+                fail("Expected IllegalArgumentException for payload: $payload")
+            } catch (e: IllegalArgumentException) {
+                // Expected
+                assertTrue(e.message!!.contains("prohibited shell control characters"))
+            }
+        }
+    }
+
+    @Test
+    fun `buildValidatedArgumentString constructs safe command string`() {
+        val cmd = LinuxEnvironmentService.buildValidatedArgumentString(
+            subCmd = "-i",
+            arguments = listOf("wlan0", "-n", "-s", "0")
+        )
+        assertEquals("-i wlan0 -n -s 0", cmd)
+    }
 }

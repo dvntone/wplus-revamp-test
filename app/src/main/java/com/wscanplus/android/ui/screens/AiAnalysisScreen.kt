@@ -834,10 +834,10 @@ fun AiProviderConfigDialog(
     val context = LocalContext.current
     val prefs = remember { AppPreferences.main(context) }
 
-    var geminiKey by remember { mutableStateOf(prefs.getString(AppPreferences.KEY_GEMINI_KEY, "") ?: "") }
+    var geminiKey by remember { mutableStateOf(AppPreferences.getSecureSecret(context, AppPreferences.KEY_GEMINI_KEY)) }
     var openAiBaseUrl by remember { mutableStateOf(prefs.getString(AppPreferences.KEY_OPENAI_BASE_URL, AppPreferences.DEFAULT_OPENAI_BASE_URL) ?: AppPreferences.DEFAULT_OPENAI_BASE_URL) }
     var openAiModel by remember { mutableStateOf(prefs.getString(AppPreferences.KEY_OPENAI_MODEL, AppPreferences.DEFAULT_OPENAI_MODEL) ?: AppPreferences.DEFAULT_OPENAI_MODEL) }
-    var openAiKey by remember { mutableStateOf(prefs.getString(AppPreferences.KEY_OPENAI_API_KEY, "") ?: "") }
+    var openAiKey by remember { mutableStateOf(AppPreferences.getSecureSecret(context, AppPreferences.KEY_OPENAI_API_KEY)) }
     var avfEndpoint by remember { mutableStateOf(prefs.getString(AppPreferences.KEY_AVF_ENDPOINT, AppPreferences.DEFAULT_AVF_ENDPOINT) ?: AppPreferences.DEFAULT_AVF_ENDPOINT) }
 
     AlertDialog(
@@ -940,12 +940,12 @@ fun AiProviderConfigDialog(
             Button(
                 onClick = {
                     prefs.edit()
-                        .putString(AppPreferences.KEY_GEMINI_KEY, geminiKey.trim())
                         .putString(AppPreferences.KEY_OPENAI_BASE_URL, openAiBaseUrl.trim())
                         .putString(AppPreferences.KEY_OPENAI_MODEL, openAiModel.trim())
-                        .putString(AppPreferences.KEY_OPENAI_API_KEY, openAiKey.trim())
                         .putString(AppPreferences.KEY_AVF_ENDPOINT, avfEndpoint.trim())
                         .apply()
+                    AppPreferences.setSecureSecret(context, AppPreferences.KEY_GEMINI_KEY, geminiKey.trim())
+                    AppPreferences.setSecureSecret(context, AppPreferences.KEY_OPENAI_API_KEY, openAiKey.trim())
                     onDismiss()
                 }
             ) {

@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wscanplus.android.WscanPlusApplication
 import com.wscanplus.android.core.AgentMcpServer
+import com.wscanplus.android.core.AppPreferences
 import com.wscanplus.android.core.IntegrationsManager
 import com.wscanplus.android.core.LinuxEnvironmentService
 import com.wscanplus.android.core.PixelAvfDebianGuest
@@ -765,11 +766,12 @@ fun IntegrationsScreen() {
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Column(modifier = Modifier.padding(12.dp)) {
-                                        Text("Connection Endpoints:", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
-                                        Text("• MCP Protocol: http://$localIp:${mcpServer.port}/mcp", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                                        Text("• Terminal REST: http://$localIp:${mcpServer.port}/api/terminal", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                                        Text("• Threat Logs: http://$localIp:${mcpServer.port}/api/threats", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-                                        Text("• System Status: http://$localIp:${mcpServer.port}/status", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                        Text("Connection Endpoints (Zero-Trust Loopback):", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                                        Text("• Host Bridge: adb forward tcp:${mcpServer.port} tcp:${mcpServer.port}", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                                        Text("• MCP Protocol: http://127.0.0.1:${mcpServer.port}/mcp", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                        Text("• Terminal REST: http://127.0.0.1:${mcpServer.port}/api/terminal", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                        Text("• Threat Logs: http://127.0.0.1:${mcpServer.port}/api/threats", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                                        Text("• System Status: http://127.0.0.1:${mcpServer.port}/status", fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                                     }
                                 }
 
@@ -779,17 +781,21 @@ fun IntegrationsScreen() {
                                 ) {
                                     OutlinedButton(
                                         onClick = {
+                                            val token = AppPreferences.getOrCreateMcpAuthToken(context)
                                             val configJson = """
 {
   "mcpServers": {
     "wscanplus-avf": {
-      "url": "http://$localIp:${mcpServer.port}/mcp"
+      "url": "http://127.0.0.1:${mcpServer.port}/mcp",
+      "headers": {
+        "Authorization": "Bearer $token"
+      }
     }
   }
 }
                                             """.trimIndent()
                                             clipboardManager.setText(AnnotatedString(configJson))
-                                            scope.launch { snackbarHostState.showSnackbar("Copied MCP config to clipboard") }
+                                            scope.launch { snackbarHostState.showSnackbar("Copied MCP config with auth token") }
                                         },
                                         modifier = Modifier.weight(1f)
                                     ) {
@@ -800,9 +806,10 @@ fun IntegrationsScreen() {
 
                                     OutlinedButton(
                                         onClick = {
-                                            val curlCmd = "curl -X POST http://$localIp:${mcpServer.port}/api/terminal -H \"Content-Type: application/json\" -d '{\"command\": \"uname -a\"}'"
+                                            val token = AppPreferences.getOrCreateMcpAuthToken(context)
+                                            val curlCmd = "curl -X POST http://127.0.0.1:${mcpServer.port}/api/terminal -H \"Authorization: Bearer $token\" -H \"Content-Type: application/json\" -d '{\"command\": \"uname -a\"}'"
                                             clipboardManager.setText(AnnotatedString(curlCmd))
-                                            scope.launch { snackbarHostState.showSnackbar("Copied curl command to clipboard") }
+                                            scope.launch { snackbarHostState.showSnackbar("Copied authenticated CLI command") }
                                         },
                                         modifier = Modifier.weight(1f)
                                     ) {

@@ -70,6 +70,18 @@ class AttackHeuristics {
         }
     }
 
+    enum class TelemetrySource(val displayName: String, val isMonitorMode: Boolean) {
+        BEACON_SCAN("Standard 802.11 Beacon / Probe (ScanResult)", false),
+        MONITOR_MODE_FRAME_CAPTURE("Raw 802.11 Monitor-Mode Capture", true),
+        ISOLATED_TEST_FIXTURE("Isolated Test Fixture (Non-Production)", false)
+    }
+
+    enum class DetectionCapabilityStatus {
+        AVAILABLE,
+        MONITOR_MODE_REQUIRED,
+        UNAVAILABLE
+    }
+
     data class ThreatEvent(
         val attackType: AttackType,
         val severity: Severity,
@@ -78,7 +90,26 @@ class AttackHeuristics {
         val description: String,
         val timestampMs: Long = System.currentTimeMillis(),
         val supportingEvidence: Map<String, String> = emptyMap(),
+        val telemetrySource: TelemetrySource = TelemetrySource.BEACON_SCAN
     )
+
+    /**
+     * Determines whether a given attack detector is operational under current hardware capture capabilities.
+     * Android standard scanning (ScanResult) can detect Evil Twin anomalies via beacon/probe metadata,
+     * while Deauth Flood, PMKID Sniffing, and KRACK strictly require raw 802.11 monitor-mode packet capture.
+     */
+    fun getCapabilityStatus(attackType: AttackType, isMonitorModeActive: Boolean): DetectionCapabilityStatus {
+        return when (attackType) {
+            AttackType.EVIL_TWIN -> DetectionCapabilityStatus.AVAILABLE
+            AttackType.DEAUTH_FLOOD,
+            AttackType.PMKID_SNIFFING,
+            AttackType.KRACK -> if (isMonitorModeActive) {
+                DetectionCapabilityStatus.AVAILABLE
+            } else {
+                DetectionCapabilityStatus.MONITOR_MODE_REQUIRED
+            }
+        }
+    }
 
     // ── Internal state ───────────────────────────────────────────────────────
 
@@ -271,6 +302,7 @@ class AttackHeuristics {
                 ssid = "",
                 description = "${timestamps.size} Deauth frames in ${DEAUTH_WINDOW_MS / 1000}s " +
                     "from BSSID ${frame.bssid} targeting ${frame.destMac}.",
+                telemetrySource = TelemetrySource.MONITOR_MODE_FRAME_CAPTURE,
                 supportingEvidence = mapOf(
                     "attackSubtype" to "DEAUTH_FLOOD",
                     "bssid" to frame.bssid,
@@ -279,7 +311,8 @@ class AttackHeuristics {
                     "reasonCode" to frame.reasonCode.toString(),
                     "frameCountInWindow" to timestamps.size.toString(),
                     "windowDurationSec" to (DEAUTH_WINDOW_MS / 1000).toString(),
-                    "isBroadcast" to broadcast.toString()
+                    "isBroadcast" to broadcast.toString(),
+                    "detectionScope" to "MONITOR_MODE_FRAME_CAPTURE"
                 )
             )
         } else null
@@ -314,12 +347,14 @@ class AttackHeuristics {
                     ssid = "",
                     description = "EAPOL M1 from unassociated MAC ${frame.sourceMac} " +
                         "targeting AP ${frame.bssid}. Possible PMKID harvest attempt.",
+                    telemetrySource = TelemetrySource.MONITOR_MODE_FRAME_CAPTURE,
                     supportingEvidence = mapOf(
                         "attackSubtype" to "PMKID_SNIFFING",
                         "bssid" to frame.bssid,
                         "unassociatedClientMac" to frame.sourceMac,
                         "handshakeMessage" to "EAPOL_M1",
-                        "replayCounter" to frame.replayCounter.toString()
+                        "replayCounter" to frame.replayCounter.toString(),
+                        "detectionScope" to "MONITOR_MODE_FRAME_CAPTURE"
                     )
                 )
             }
@@ -342,12 +377,14 @@ class AttackHeuristics {
                     ssid = "",
                     description = "Duplicate EAPOL M3 replay counter (${frame.replayCounter}) " +
                         "from AP ${frame.bssid} — possible KRACK nonce-reuse attack.",
+                    telemetrySource = TelemetrySource.MONITOR_MODE_FRAME_CAPTURE,
                     supportingEvidence = mapOf(
                         "attackSubtype" to "KRACK_NONCE_REUSE",
                         "bssid" to frame.bssid,
                         "clientMac" to frame.sourceMac,
                         "duplicateReplayCounter" to frame.replayCounter.toString(),
-                        "handshakeMessage" to "EAPOL_M3"
+                        "handshakeMessage" to "EAPOL_M3",
+                        "detectionScope" to "MONITOR_MODE_FRAME_CAPTURE"
                     )
                 )
             } else {

@@ -185,6 +185,68 @@ class AttackHeuristicsTest {
         assertTrue("No threats expected after reset", threats.isEmpty())
     }
 
+    // ── Telemetry & Capability Demarcation ────────────────────────────────────
+
+    @Test
+    fun `getCapabilityStatus reports AVAILABLE for Evil Twin on standard beacon scan`() {
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.AVAILABLE,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.EVIL_TWIN, isMonitorModeActive = false)
+        )
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.AVAILABLE,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.EVIL_TWIN, isMonitorModeActive = true)
+        )
+    }
+
+    @Test
+    fun `getCapabilityStatus reports MONITOR_MODE_REQUIRED when frame capture is not active`() {
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.MONITOR_MODE_REQUIRED,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.DEAUTH_FLOOD, isMonitorModeActive = false)
+        )
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.MONITOR_MODE_REQUIRED,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.PMKID_SNIFFING, isMonitorModeActive = false)
+        )
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.MONITOR_MODE_REQUIRED,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.KRACK, isMonitorModeActive = false)
+        )
+    }
+
+    @Test
+    fun `getCapabilityStatus reports AVAILABLE for frame detectors when monitor mode is active`() {
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.AVAILABLE,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.DEAUTH_FLOOD, isMonitorModeActive = true)
+        )
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.AVAILABLE,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.PMKID_SNIFFING, isMonitorModeActive = true)
+        )
+        assertEquals(
+            AttackHeuristics.DetectionCapabilityStatus.AVAILABLE,
+            heuristics.getCapabilityStatus(AttackHeuristics.AttackType.KRACK, isMonitorModeActive = true)
+        )
+    }
+
+    @Test
+    fun `ThreatEvent demarcates telemetrySource as MONITOR_MODE_FRAME_CAPTURE for deauth and EAPOL`() {
+        val bssid = "AA:BB:CC:DD:EE:01"
+        val now = System.currentTimeMillis()
+        var deauthThreat: AttackHeuristics.ThreatEvent? = null
+        repeat(AttackHeuristics.DEFAULT_DEAUTH_THRESHOLD + 1) { i ->
+            deauthThreat = heuristics.analyzeDeauthFrame(makeDeauthFrame(bssid = bssid, timestampMs = now + i))
+        }
+        assertNotNull(deauthThreat)
+        assertEquals(AttackHeuristics.TelemetrySource.MONITOR_MODE_FRAME_CAPTURE, deauthThreat!!.telemetrySource)
+
+        val eapolThreats = heuristics.analyzeEapolFrame(makeEapolFrame())
+        assertEquals(1, eapolThreats.size)
+        assertEquals(AttackHeuristics.TelemetrySource.MONITOR_MODE_FRAME_CAPTURE, eapolThreats[0].telemetrySource)
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun makeDeauthFrame(
