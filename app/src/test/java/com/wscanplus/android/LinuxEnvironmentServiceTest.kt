@@ -230,4 +230,54 @@ class LinuxEnvironmentServiceTest {
         )
         assertEquals("-i wlan0 -n -s 0", cmd)
     }
+
+    @Test
+    fun `parseFoundToolPaths accurately extracts tool mappings for kismet, tshark, and tcpdump`() {
+        val rawOutput = """
+            FOUND:kismet:/usr/bin/kismet
+            FOUND:tcpdump:/usr/sbin/tcpdump
+            FOUND:tshark:/usr/bin/tshark
+        """.trimIndent()
+
+        val paths = LinuxEnvironmentService.parseFoundToolPaths(rawOutput)
+        assertEquals(3, paths.size)
+        assertEquals("/usr/bin/kismet", paths["kismet"])
+        assertEquals("/usr/sbin/tcpdump", paths["tcpdump"])
+        assertEquals("/usr/bin/tshark", paths["tshark"])
+        assertNull(paths["aircrack-ng"])
+    }
+
+    @Test
+    fun `parseFoundToolPaths handles direct filesystem paths without FOUND prefix`() {
+        val rawOutput = """
+            /usr/bin/kismet
+            /usr/sbin/tcpdump
+            /usr/bin/tshark
+        """.trimIndent()
+
+        val paths = LinuxEnvironmentService.parseFoundToolPaths(rawOutput)
+        assertEquals(3, paths.size)
+        assertEquals("/usr/bin/kismet", paths["kismet"])
+        assertEquals("/usr/sbin/tcpdump", paths["tcpdump"])
+        assertEquals("/usr/bin/tshark", paths["tshark"])
+    }
+
+    @Test
+    fun `GuestToolInfo data structure encapsulates existence, version, and execution channel`() {
+        val tool = LinuxEnvironmentService.GuestToolInfo(
+            name = "kismet",
+            isInstalled = true,
+            path = "/usr/bin/kismet",
+            version = "Kismet 2024-02-R1",
+            executionChannel = "Pixel AVF Debian Guest",
+            error = null
+        )
+
+        assertEquals("kismet", tool.name)
+        assertTrue(tool.isInstalled)
+        assertEquals("/usr/bin/kismet", tool.path)
+        assertEquals("Kismet 2024-02-R1", tool.version)
+        assertEquals("Pixel AVF Debian Guest", tool.executionChannel)
+        assertNull(tool.error)
+    }
 }

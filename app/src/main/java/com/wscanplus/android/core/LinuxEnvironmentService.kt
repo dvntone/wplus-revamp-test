@@ -71,9 +71,21 @@ object LinuxEnvironmentService {
         val lastProbedTimestamp: Long = System.currentTimeMillis()
     )
 
+    data class GuestToolInfo(
+        val name: String,
+        val isInstalled: Boolean,
+        val path: String? = null,
+        val version: String? = null,
+        val executionChannel: String = "Pixel AVF Debian Guest",
+        val error: String? = null
+    )
+
     // Reactive StateFlows for UI observation
     private val _installedBinaries = MutableStateFlow<List<InstalledBinaryInfo>>(emptyList())
     val installedBinaries: StateFlow<List<InstalledBinaryInfo>> = _installedBinaries.asStateFlow()
+
+    private val _guestTools = MutableStateFlow<List<GuestToolInfo>>(emptyList())
+    val guestTools: StateFlow<List<GuestToolInfo>> = _guestTools.asStateFlow()
 
     private val _isProbingBinaries = MutableStateFlow(false)
     val isProbingBinaries: StateFlow<Boolean> = _isProbingBinaries.asStateFlow()
@@ -417,6 +429,160 @@ object LinuxEnvironmentService {
         } finally {
             _isProbingBinaries.value = false
         }
+    }
+
+    /**
+     * Scans `/usr/bin` and `/usr/sbin` inside the Debian VM for `kismet`, `tshark`, and `tcpdump`.
+     * Returns the detected versions, existence status, and executable paths for each tool.
+     *
+     * Guardrails:
+     * - Gracefully handles connectivity timeouts without throwing unhandled exceptions.
+     * - Never relies on or executes against the Android host shell.
+     * - Dispatches exclusively across the authenticated AVF guest channel (or Termux VM bridge).
+     */
+    suspend fun probeGuestTools(
+        context: Context,
+        tools: List<String> = listOf("kismet", "tshark", "tcpdump"),
+        searchPaths: List<String> = listOf("/usr/bin", "/usr/sbin"),
+        host: String = PixelAvfDebianGuest.DEFAULT_GUEST_HOST,
+        port: Int = PixelAvfDebianGuest.DEFAULT_SSH_PORT,
+        timeoutSeconds: Long = 4L
+    ): List<GuestToolInfo> = withContext(Dispatchers.IO) {
+        val env = getEnvironment(context)
+        val isAvf = env == LinuxEnvironment.ANDROID_LINUX_VM
+
+        if (env == LinuxEnvironment.NONE) {
+            val unavailList = tools.map { tool ->
+                GuestToolInfo(
+                    name = tool,
+                    isInstalled = false,
+                    path = null,
+                    version = null,
+                    executionChannel = "NONE",
+                    error = "No Linux VM execution environment available"
+                )
+            }
+            _guestTools.value = unavailList
+            return@withContext unavailList
+        }
+
+        try {
+            val toolsArg = tools.joinToString(" ")
+            val dirsArg = searchPaths.joinToString(" ")
+            val scanCmd = "for bin in $toolsArg; do for dir in $dirsArg; do if [ -x \"\$dir/\$bin\" ]; then echo \"FOUND:\$bin:\$dir/\$bin\"; break; fi; done; done"
+
+            val scanRes = if (isAvf) {
+                PixelAvfDebianGuest.executeGuestCommand(context, scanCmd, host, port, timeoutSeconds = timeoutSeconds)
+            } else {
+                val tRes = TermuxBridge.executeCommand(context, scanCmd, timeoutSeconds = timeoutSeconds)
+                PixelAvfDebianGuest.GuestExecutionResult(
+                    success = tRes.success,
+                    exitCode = tRes.exitCode,
+                    stdout = tRes.stdout,
+                    stderr = tRes.stderr,
+                    verifiedDebianEnvironment = false,
+                    executionChannel = tRes.executionChannel
+                )
+            }
+
+            if (!scanRes.success && scanRes.stdout.isBlank()) {
+                val errMsg = scanRes.stderr?.ifBlank { null } ?: "Debian VM connectivity timeout or service unavailable"
+                val timeoutList = tools.map { tool ->
+                    GuestToolInfo(
+                        name = tool,
+                        isInstalled = false,
+                        path = null,
+                        version = null,
+                        executionChannel = scanRes.executionChannel,
+                        error = errMsg
+                    )
+                }
+                _guestTools.value = timeoutList
+                return@withContext timeoutList
+            }
+
+            val foundPaths = parseFoundToolPaths(scanRes.stdout)
+
+            val results = tools.map { tool ->
+                val path = foundPaths[tool]
+                val isInstalled = path != null
+                var version: String? = null
+                var toolError: String? = null
+
+                if (isInstalled) {
+                    val versionCmd = getBinaryVersionCommand(tool)
+                    val verRes = if (isAvf) {
+                        PixelAvfDebianGuest.executeGuestCommand(context, versionCmd, host, port, timeoutSeconds = timeoutSeconds)
+                    } else {
+                        val tRes = TermuxBridge.executeCommand(context, versionCmd, timeoutSeconds = timeoutSeconds)
+                        PixelAvfDebianGuest.GuestExecutionResult(
+                            success = tRes.success,
+                            exitCode = tRes.exitCode,
+                            stdout = tRes.stdout,
+                            stderr = tRes.stderr,
+                            verifiedDebianEnvironment = false,
+                            executionChannel = tRes.executionChannel
+                        )
+                    }
+
+                    if (verRes.success || verRes.stdout.isNotBlank()) {
+                        version = parseBinaryVersion(tool, verRes.stdout)
+                    } else {
+                        toolError = verRes.stderr
+                    }
+                }
+
+                GuestToolInfo(
+                    name = tool,
+                    isInstalled = isInstalled,
+                    path = path,
+                    version = version,
+                    executionChannel = if (isAvf) "Pixel AVF Debian Guest" else "Termux Userland",
+                    error = toolError
+                )
+            }
+
+            _guestTools.value = results
+            results
+        } catch (e: Exception) {
+            Log.e(TAG, "Error probing guest tools in Debian VM: ${e.message}", e)
+            val errorList = tools.map { tool ->
+                GuestToolInfo(
+                    name = tool,
+                    isInstalled = false,
+                    path = null,
+                    version = null,
+                    executionChannel = "UNREACHABLE",
+                    error = "Connectivity exception: ${e.message ?: "timeout"}"
+                )
+            }
+            _guestTools.value = errorList
+            errorList
+        }
+    }
+
+    /**
+     * Parses stdout from the guest tool scan script, matching paths in /usr/bin and /usr/sbin.
+     */
+    fun parseFoundToolPaths(rawOutput: String): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        rawOutput.lines().forEach { line ->
+            val trimmed = line.trim()
+            if (trimmed.startsWith("FOUND:")) {
+                val parts = trimmed.split(":")
+                if (parts.size >= 3) {
+                    val tool = parts[1].trim()
+                    val path = parts.subList(2, parts.size).joinToString(":").trim()
+                    if (tool.isNotEmpty() && path.isNotEmpty()) {
+                        result[tool] = path
+                    }
+                }
+            } else if (trimmed.startsWith("/usr/bin/") || trimmed.startsWith("/usr/sbin/")) {
+                val binName = trimmed.substringAfterLast("/")
+                result[binName] = trimmed
+            }
+        }
+        return result
     }
 
     /**
